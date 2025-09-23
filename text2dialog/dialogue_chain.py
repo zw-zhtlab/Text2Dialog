@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 对话链：从小说等长文本中提取角色对话
@@ -39,9 +39,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ========== 控制/取消 支持（新增） ==========
 class CancelledError(RuntimeError):
-    """用户请求取消作业时抛出的异常（用于优雅收尾）。"""
+    """用户请求取消作业时抛出的异常。"""
 
 
 class ControlState:
@@ -165,7 +164,7 @@ class ThreadSafeDialogueChain:
     def process_chunk(self, work_item: WorkItem) -> List[ChunkDialogueItem]:
         """处理单个文本块，返回标准输出项。"""
         try:
-            # 新增：在进入处理前先响应暂停/取消
+            # 在进入处理前先响应暂停/取消
             self.extractor.control.wait_if_paused()
             self.extractor.control.raise_if_cancelled()
 
@@ -176,7 +175,7 @@ class ThreadSafeDialogueChain:
             )
             dialogues = self.extractor._parse_and_validate_response(response)
 
-            # 线程安全地转换为标准输出（始终包含 chunk_id/dialogue_index）
+            # 线程安全地转换为标准输出
             with self.lock:
                 chunk_dialogues: List[ChunkDialogueItem] = []
                 for dialogue_index, dialogue in enumerate(dialogues):
@@ -265,7 +264,7 @@ class DialogueChain:
         self.cache_dir = cache_dir or getattr(Config, "CACHE_DIR", ".cache")
         Path(self.cache_dir).mkdir(exist_ok=True, parents=True)
 
-        # 新增：控制器（读取 .cache/control.json）
+        # 控制器（读取 .cache/control.json）
         self.control = ControlState(self.cache_dir)
 
         logger.info(f"对话链初始化完成 - 平台: {self.platform} ({platform_config['description']})")
@@ -553,7 +552,7 @@ IMPORTANT GUIDELINES:
 
         last_err: Optional[BaseException] = None
         for attempt in range(max_retries):
-            # 新增：每次尝试前响应暂停/取消
+            # 每次尝试前响应暂停/取消
             self.control.wait_if_paused()
             self.control.raise_if_cancelled()
 
@@ -585,7 +584,7 @@ IMPORTANT GUIDELINES:
                         # 记录后回退到 Chat Completions
                         logger.debug(f"Responses API 不可用或提取失败，回退到 Chat Completions：{e}")
 
-                # 2) 通用回退：OpenAI 兼容 Chat Completions（DeepSeek、Qwen、Moonshot、SiliconFlow 等）
+                # 2) 通用回退：OpenAI 兼容 Chat Completions
                 resp = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
@@ -602,7 +601,7 @@ IMPORTANT GUIDELINES:
                 return content
 
             except CancelledError:
-                # 透传取消，让上层优雅收尾
+                # 透传取消，让上层收尾
                 raise
             except Exception as e:
                 last_err = e
@@ -1254,7 +1253,7 @@ IMPORTANT GUIDELINES:
                         data = json.loads(line.strip())
                         chunk_id = data.get("chunk_id")
                         if chunk_id is None:
-                            raise ValueError("检测到缺少 chunk_id 的记录，已取消对旧格式的兼容。")
+                            raise ValueError("检测到缺少 chunk_id 的记录。")
 
                         if chunk_id not in chunk_stats:
                             chunk_stats[chunk_id] = {
@@ -1305,7 +1304,7 @@ def main() -> int:
     parser.add_argument(
         "-p",
         "--platform",
-        help="指定平台（如 deepseek、openai、moonshot、siliconflow、custom 等）",
+        help="指定平台",
     )
     parser.add_argument(
         "-l",
