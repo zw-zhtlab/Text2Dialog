@@ -12,6 +12,8 @@ import json
 import time
 import logging
 import threading
+import statistics
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from typing import Dict, List, Any, Optional, Set
 from dataclasses import dataclass, field
@@ -773,10 +775,10 @@ IMPORTANT GUIDELINES:
             "file_path": file_path,
             "processed_chunks": processed_chunks,
             "total_chunks": total_chunks,
-            "stage": stage,                    
+            "stage": stage,
             "message": message or "",
             "elapsed_sec": elapsed,
-            "speed_cps": speed,                
+            "speed_cps": speed,
             "eta_sec": eta,
             "timestamp": now,
         }
@@ -1139,28 +1141,90 @@ IMPORTANT GUIDELINES:
 
     # ---------- 统计与工具 ----------
     def get_statistics(self, output_file: str) -> Dict[str, Any]:
-        """获取输出文件的统计信息。"""
+        """获取输出文件的统计信息"""
         try:
-            dialogues = []
+            role_counts: Dict[str, int] = defaultdict(int)
+            role_char_sum: Dict[str, int] = defaultdict(int)
+
+            total = 0
+            char_sum = 0
+            lengths: List[int] = []
+            token_sum = 0
+            token_enabled = hasattr(self, "encoder") and self.encoder is not None
+
+            # 相邻轮角色转移（同 chunk 内）
+            transitions: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            last_role_by_chunk: Dict[int, str] = {}
+            invalid_lines = 0
+
             with open(output_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        data = json.loads(line.strip())
-                        dialogues.append(data)
+                for lineno, line in enumerate(f, 1):
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        d = json.loads(s)
+                    except json.JSONDecodeError as e:
+                        invalid_lines += 1
+                        logger.debug(f"统计跳过无效 JSON 行 {lineno}: {e}")
+                        continue
 
-            role_counts: Dict[str, int] = {}
-            for d in dialogues:
-                role = d.get("role", "Unknown")
-                role_counts[role] = role_counts.get(role, 0) + 1
+                    role = (d.get("role") or "Unknown")
+                    text = (d.get("dialogue") or "")
 
-            return {
-                "total_dialogues": len(dialogues),
+                    total += 1
+                    L = len(text)
+                    char_sum += L
+                    lengths.append(L)
+                    role_counts[role] += 1
+                    role_char_sum[role] += L
+
+                    if token_enabled:
+                        try:
+                            token_sum += len(self.encoder.encode(text))
+                        except Exception:
+                            token_enabled = False  # 出错则降级为不统计 token
+
+                    cid = d.get("chunk_id")
+                    if cid is not None:
+                        prev_role = last_role_by_chunk.get(cid)
+                        if prev_role is not None:
+                            transitions[prev_role][role] += 1
+                        last_role_by_chunk[cid] = role
+
+            avg_len = (char_sum / total) if total else 0
+            if lengths:
+                p50 = statistics.median(lengths)
+                p90 = statistics.quantiles(lengths, n=10, method="inclusive")[8] if len(lengths) >= 10 else max(lengths)
+                p99 = statistics.quantiles(lengths, n=100, method="inclusive")[98] if len(lengths) >= 100 else max(lengths)
+                min_len, max_len = min(lengths), max(lengths)
+            else:
+                p50 = p90 = p99 = min_len = max_len = 0
+
+            avg_tokens = (token_sum / total) if (total and token_enabled) else None
+
+            result: Dict[str, Any] = {
+                "total_dialogues": total,
                 "unique_roles": len(role_counts),
-                "role_distribution": role_counts,
-                "average_dialogue_length": (
-                    sum(len(d.get("dialogue", "")) for d in dialogues) / len(dialogues) if dialogues else 0
-                ),
+                "role_distribution": dict(role_counts),
+                "average_dialogue_length": avg_len,
+                "stats_version": "1.1",
+                "length_summary": {
+                    "min": min_len,
+                    "p50": p50,
+                    "p90": p90,
+                    "p99": p99,
+                    "max": max_len,
+                },
+                "average_tokens_per_dialogue": avg_tokens,
+                "per_role": {
+                    "char_sum": dict(role_char_sum),
+                    "avg_length": {r: (role_char_sum[r] / role_counts[r]) for r in role_counts},
+                },
+                "role_transitions": {a: dict(b) for a, b in transitions.items()},
+                "invalid_lines": invalid_lines,
             }
+            return result
         except Exception as e:
             logger.error(f"统计信息生成失败：{e}")
             return {}
@@ -1183,7 +1247,6 @@ IMPORTANT GUIDELINES:
                     if line.strip():
                         dialogues.append(json.loads(line.strip()))
 
-            # 取消旧格式兼容：必须包含 chunk_id
             if not all("chunk_id" in d and "dialogue_index" in d for d in dialogues):
                 raise ValueError("文件不包含 chunk_id/dialogue_index，无法排序。")
 
@@ -1246,36 +1309,87 @@ IMPORTANT GUIDELINES:
         try:
             chunk_stats: Dict[int, Dict[str, Any]] = {}
             total_dialogues = 0
+            invalid_lines = 0
 
             with open(output_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        data = json.loads(line.strip())
-                        chunk_id = data.get("chunk_id")
-                        if chunk_id is None:
-                            raise ValueError("检测到缺少 chunk_id 的记录。")
+                for lineno, line in enumerate(f, 1):
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        data = json.loads(s)
+                    except json.JSONDecodeError as e:
+                        invalid_lines += 1
+                        logger.debug(f"Chunk 统计跳过无效 JSON 行 {lineno}: {e}")
+                        continue
 
-                        if chunk_id not in chunk_stats:
-                            chunk_stats[chunk_id] = {
-                                "dialogue_count": 0,
-                                "roles": {},
-                                "total_length": 0,
-                            }
+                    chunk_id = data.get("chunk_id")
+                    if chunk_id is None:
+                        invalid_lines += 1
+                        logger.debug(f"Chunk 统计跳过缺少 chunk_id 的记录（行 {lineno}）")
+                        continue
 
-                        chunk_stats[chunk_id]["dialogue_count"] += 1
-                        role = data.get("role", "Unknown")
-                        chunk_stats[chunk_id]["roles"][role] = chunk_stats[chunk_id]["roles"].get(role, 0) + 1
-                        chunk_stats[chunk_id]["total_length"] += len(data.get("dialogue", ""))
-                        total_dialogues += 1
+                    role = (data.get("role") or "Unknown")
+                    text = (data.get("dialogue") or "")
+                    L = len(text)
+
+                    st = chunk_stats.get(chunk_id)
+                    if st is None:
+                        st = {
+                            "dialogue_count": 0,
+                            "roles": {},
+                            "total_length": 0,
+                            "min_length": None,
+                            "max_length": 0,
+                        }
+                        chunk_stats[chunk_id] = st
+
+                    st["dialogue_count"] += 1
+                    st["total_length"] += L
+                    st["roles"][role] = st["roles"].get(role, 0) + 1
+                    st["max_length"] = L if L > st["max_length"] else st["max_length"]
+                    st["min_length"] = L if (st["min_length"] is None or L < st["min_length"]) else st["min_length"]
+                    total_dialogues += 1
+
+            # 逐块补充平均长度，并把 None 的最小值归零
+            for st in chunk_stats.values():
+                c = st["dialogue_count"]
+                st["average_length"] = (st["total_length"] / c) if c else 0
+                if st["min_length"] is None:
+                    st["min_length"] = 0
+
+            # 分块对话密度的分布摘要 & Top 5
+            ds = [st["dialogue_count"] for st in chunk_stats.values()]
+            if ds:
+                min_dc = min(ds)
+                max_dc = max(ds)
+                mean_dc = sum(ds) / len(ds)
+                p50_dc = statistics.median(ds)
+                p90_dc = statistics.quantiles(ds, n=10, method="inclusive")[8] if len(ds) >= 10 else max_dc
+            else:
+                min_dc = max_dc = mean_dc = p50_dc = p90_dc = 0
+
+            densest = sorted(
+                ((cid, st["dialogue_count"]) for cid, st in chunk_stats.items()),
+                key=lambda x: x[1], reverse=True
+            )[:5]
 
             summary = {
                 "total_chunks": len(chunk_stats),
                 "total_dialogues": total_dialogues,
                 "average_dialogues_per_chunk": (total_dialogues / len(chunk_stats) if chunk_stats else 0),
                 "chunk_details": chunk_stats,
+                "dialogues_per_chunk_summary": {
+                    "min": min_dc,
+                    "p50": p50_dc,
+                    "p90": p90_dc,
+                    "max": max_dc,
+                    "mean": mean_dc,
+                },
+                "top_dense_chunks": [{"chunk_id": cid, "dialogue_count": c} for cid, c in densest],
+                "invalid_lines": invalid_lines,
             }
             return summary
-
         except Exception as e:
             logger.error(f"Chunk 统计信息生成失败：{e}")
             return {}
@@ -1286,7 +1400,7 @@ def main() -> int:
     """主函数 - 示例用法 / 命令行接口 """
     import argparse
 
-    parser = argparse.ArgumentParser(description="从小说等长文本中提取角色对话（标准格式：含 chunk_id/dialogue_index）")
+    parser = argparse.ArgumentParser(description="从小说等长文本中提取角色对话")
     parser.add_argument("input_file", nargs="?", help="输入文本文件路径")
     parser.add_argument("-o", "--output", help="输出文件路径（可选）")
     parser.add_argument(
@@ -1396,19 +1510,17 @@ def main() -> int:
             cache_dir=getattr(Config, "CACHE_DIR", ".cache"),  # CLI 模式下仍可使用 Config.CACHE_DIR
         )
 
-        # 提取对话
         if args.concurrent:
-            print(f"🚀 使用多线程并发（{extractor.max_workers} 个线程）")
+            print(f"使用多线程并发（{extractor.max_workers} 个线程）")
             output_file = extractor.extract_dialogues_concurrent(args.input_file, args.output)
         else:
-            print("📝 使用单线程处理")
+            print("使用单线程处理")
             output_file = extractor.extract_dialogues(args.input_file, args.output)
 
-        # 后处理：排序
         if args.sort_output:
-            print("🔄 按 chunk_id 排序输出文件 ...")
+            print("按 chunk_id 排序输出文件 ...")
             sorted_file = extractor.sort_dialogues(output_file)
-            print(f"✅ 排序完成：{sorted_file}")
+            print(f"排序完成：{sorted_file}")
             output_file = sorted_file
 
         # 统计信息
@@ -1417,17 +1529,40 @@ def main() -> int:
             print("\n=== 统计信息 ===")
             print(f"使用平台：{extractor.platform}")
             print(f"使用模型：{extractor.model_name}")
-            print(f"处理方式：{'多线程并发' if args.concurrent else '单线程'}"
+            print(f"处理方式：{'多线程' if args.concurrent else '单线程'}"
                   f"{f'（{extractor.max_workers} 线程）' if args.concurrent else ''}")
             print(f"总对话数：{stats.get('total_dialogues', 0)}")
             print(f"角色数量：{stats.get('unique_roles', 0)}")
             print(f"平均对话长度：{stats.get('average_dialogue_length', 0):.1f} 字")
+
+            # 长度分布与 tokens
+            length_summary = stats.get("length_summary") or {}
+            if length_summary:
+                print("长度分布（字符）："
+                      f"min={length_summary.get('min', 0)}, "
+                      f"p50={length_summary.get('p50', 0)}, "
+                      f"p90={length_summary.get('p90', 0)}, "
+                      f"p99={length_summary.get('p99', 0)}, "
+                      f"max={length_summary.get('max', 0)}")
+            avg_tokens = stats.get("average_tokens_per_dialogue")
+            if isinstance(avg_tokens, (int, float)):
+                print(f"平均对话 token 数：{avg_tokens:.1f}")
 
             # 显示 chunk 统计
             chunk_stats = extractor.get_chunk_statistics(output_file)
             if chunk_stats:
                 print(f"总块数：{chunk_stats.get('total_chunks', 0)}")
                 print(f"平均每块对话数：{chunk_stats.get('average_dialogues_per_chunk', 0):.1f}")
+
+                # 每块对话数的分布摘要
+                dsum = chunk_stats.get("dialogues_per_chunk_summary") or {}
+                if dsum:
+                    print("对话密度分布（每块）："
+                          f"min={dsum.get('min', 0)}, "
+                          f"p50={dsum.get('p50', 0)}, "
+                          f"p90={dsum.get('p90', 0)}, "
+                          f"max={dsum.get('max', 0)}, "
+                          f"mean={dsum.get('mean', 0):.2f}")
 
                 details = chunk_stats.get("chunk_details", {})
                 if details:
