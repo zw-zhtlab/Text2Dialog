@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Text2Dialog 前端控制台</title>
+  <link rel="stylesheet" href="./static/style.css"/>
+</head>
+<body>
+<header class="site-header">
+  <div class="container header-bar">
+    <div class="brand">
+      <h1>Text2Dialog 可视化控制台</h1>
+      <p class="subtitle">上传文本 → 提取角色对话 → 校验 → 角色对配对 → 导出 ChatML 数据集</p>
+    </div>
+    <div class="header-right">
+      <label for="themeSelect" class="theme-label"></label>
+      <select id="themeSelect" class="theme-switch" aria-label="主题切换">
+        <option value="dark">暗色</option>
+        <option value="light-doc">亮色</option>
+      </select>
+    </div>
+  </div>
+</header>
+
+<main class="container">
+  <section class="card">
+    <h2>① 上传文本</h2>
+    <p class="hint">支持 .txt；拖拽或点击选择。</p>
+    <div id="dropzone" class="dropzone" aria-label="上传文本区域">将文件拖到这里，或 <button id="pick" class="linklike" type="button">选择文件</button></div>
+    <input id="file" type="file" accept=".txt" hidden>
+    <div id="uploadResult" class="muted"></div>
+  </section>
+
+  <section class="card">
+    <h2>② 运行设置</h2>
+    <div class="grid two">
+      <div>
+        <label>平台</label>
+        <select id="platform"></select>
+      </div>
+      <div>
+        <label>模型名 <span class="muted">(可留空)</span></label>
+        <input id="modelName" placeholder="如 gpt-4o-mini / deepseek-chat">
+      </div>
+      <div>
+        <label>API Base URL <span class="muted">(可留空)</span></label>
+        <input id="baseUrl" placeholder="如 https://api.openai.com/v1">
+      </div>
+      <div>
+        <label>API Key <span class="muted">(仅本次运行)</span></label>
+        <input id="apiKey" placeholder="sk-..." autocomplete="off">
+      </div>
+    </div>
+
+    <details class="mt">
+      <summary>高级参数</summary>
+      <div class="grid three">
+        <div>
+          <label>并发</label>
+          <select id="concurrent">
+            <option value="true" selected>多线程</option>
+            <option value="false">单线程</option>
+          </select>
+        </div>
+        <div>
+          <label>线程数</label>
+          <input id="threads" type="number" min="1" placeholder="默认">
+        </div>
+        <div>
+          <label>温度</label>
+          <input id="temperature" type="number" min="0" max="2" step="0.1" placeholder="默认">
+        </div>
+        <div>
+          <label>Chunk 最大 Token</label>
+          <input id="maxTokenLen" type="number" min="100" step="10" placeholder="默认">
+        </div>
+        <div>
+          <label>前文覆盖 Token</label>
+          <input id="coverContent" type="number" min="0" step="10" placeholder="默认">
+        </div>
+        <div>
+          <label>保存原始 chunk 文本</label>
+          <select id="saveChunkText">
+            <option value="true">是</option>
+            <option value="false" selected>否</option>
+          </select>
+        </div>
+        <div>
+          <label>完成后排序输出</label>
+          <select id="sortOutput">
+            <option value="false" selected>否</option>
+            <option value="true">是</option>
+          </select>
+        </div>
+        <div>
+          <label>Reply 窗口</label>
+          <input id="replyWindow" type="number" min="1" placeholder="默认">
+        </div>
+        <div>
+          <label>Reply 置信度阈值</label>
+          <input id="replyConf" type="number" min="0" max="1" step="0.05" placeholder="默认">
+        </div>
+      </div>
+    </details>
+
+    <div class="actions">
+      <button id="run" class="primary" disabled>开始提取</button>
+      <button id="pause" disabled>暂停</button>
+      <button id="resume" disabled>继续</button>
+      <button id="cancel" disabled>取消</button>
+      <span id="status" class="status"></span>
+    </div>
+    <progress id="bar" value="0" max="100" style="width:100%;display:none;"></progress>
+  </section>
+
+  <section class="card">
+    <h2>③ 校验与预览</h2>
+    <div class="actions">
+      <button id="validate" disabled>校验 JSONL</button>
+      <a id="downloadExtract" class="button" href="#" download disabled>下载提取结果</a>
+    </div>
+    <pre id="validateLog" class="log"></pre>
+    <div id="preview" class="preview"></div>
+
+    <!-- 统计信息（完成后显示） -->
+    <div id="statsCard" class="stats" style="display:none;">
+      <h3>统计信息</h3>
+      <div class="grid three">
+        <div class="kpi">
+          <div class="kpi-title">总对话数</div>
+          <div id="statTotal" class="kpi-value">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-title">角色数</div>
+          <div id="statRoles" class="kpi-value">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-title">平均句长</div>
+          <div id="statAvg" class="kpi-value">—</div>
+        </div>
+      </div>
+      <div class="role-dist">
+        <div class="role-head muted">角色分布（Top 10）</div>
+        <div id="roleBars" class="role-bars"></div>
+        <button id="toggleRoles" class="linklike">展开全部</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>④ 角色对配对（数据集）</h2>
+    <div class="grid two">
+      <div>
+        <label>选择角色对 <span class="muted">(留空即选择全部有序对；支持通配 ALL/全部)</span></label>
+        <input id="pairs" placeholder="如：张三,李四 | ALL, 李四 | 李四, ALL（多个用 | 分隔）">
+      </div>
+      <div>
+        <label>最小置信度</label>
+        <input id="minConfidence" type="number" min="0" max="1" step="0.05" value="0.80">
+      </div>
+      <div>
+        <label>严格模式</label>
+        <select id="strict">
+          <option value="true" selected>开启</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>必须包含置信度</label>
+        <select id="requireConf">
+          <option value="false" selected>否</option>
+          <option value="true">是</option>
+        </select>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="buildPairs" disabled>生成 Pair 数据集</button>
+      <a id="downloadPairs" class="button" href="#" download disabled>下载 pairs.zip</a>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>⑤ 导出 ChatML 数据集</h2>
+    <div class="grid three">
+      <div>
+        <label>模式</label>
+        <select id="mode">
+          <option value="pair" selected>pair（每条 1 轮）</option>
+          <option value="stitch">stitch（同 chunk 拼接）</option>
+        </select>
+      </div>
+      <div>
+        <label>最大轮数</label>
+        <input id="maxTurns" type="number" min="1" value="4">
+      </div>
+      <div>
+        <label>最小置信度（可选）</label>
+        <input id="chatmlMinConf" type="number" min="0" max="1" step="0.05" placeholder="不过滤">
+      </div>
+      <div>
+        <label>去重</label>
+        <select id="dedupe">
+          <option value="false" selected>否</option>
+          <option value="true">是</option>
+        </select>
+      </div>
+      <div>
+        <label>反转角色</label>
+        <select id="reverse">
+          <option value="false" selected>否</option>
+          <option value="true">是</option>
+        </select>
+      </div>
+      <div>
+        <label>系统消息（可 @file）</label>
+        <input id="systemText" placeholder="如：@system.txt 或 直接写文本">
+      </div>
+    </div>
+    <div class="actions">
+      <button id="buildChatML" disabled>生成 ChatML</button>
+      <a id="downloadChatML" class="button" href="#" download disabled>下载 chatml.jsonl</a>
+    </div>
+  </section>
+
+  <footer class="muted center">Text2Dialog v0.1.0 · MIT · <a href="https://github.com/zw-zhtlab/Text2Dialog">GitHub</a></footer>
+</main>
+
+<script>
+  // 主题切换
+  (function () {
+    const KEY = 't2d-theme';
+    const selectId = 'themeSelect';
+    const THEMES = ['dark', 'light-doc'];
+
+    function applyTheme(val) {
+      const root = document.documentElement;
+      if (val === 'dark') {
+        root.setAttribute('data-theme', 'dark');
+        root.style.colorScheme = 'dark';
+      } else {
+        root.setAttribute('data-theme', 'light-doc');
+        root.style.colorScheme = 'light';
+      }
+    }
+
+    function initialTheme() {
+      const saved = localStorage.getItem(KEY);
+      if (THEMES.includes(saved)) return saved;
+      // 首次/历史无效值：依据系统偏好选择一次性初始主题，并写回存储
+      const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      const fallback = prefersDark ? 'dark' : 'light-doc';
+      localStorage.setItem(KEY, fallback);
+      return fallback;
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+      const select = document.getElementById(selectId);
+      const theme = initialTheme();
+      applyTheme(theme);
+      if (select) {
+        select.value = theme;
+        select.addEventListener('change', function () {
+          const val = select.value;
+          localStorage.setItem(KEY, val);
+          applyTheme(val);
+        });
+      }
+    });
+  })();
+</script>
+
+<script src="./static/app.js"></script>
+
+<script>
+  (function () {
+    document.addEventListener('DOMContentLoaded', function () {
+      const cancelBtn = document.getElementById('cancel');
+      const statusEl = document.getElementById('status');
+      if (!cancelBtn || !statusEl) return;
+
+      // 当点击“取消”后，显示“已取消”
+      cancelBtn.addEventListener('click', function () {
+        // 让 app.js 的取消逻辑先运行，避免相互覆盖
+        setTimeout(function () {
+          statusEl.textContent = '已取消';
+        }, 0);
+      });
+      const runBtn = document.getElementById('run');
+      if (runBtn) {
+        runBtn.addEventListener('click', function () {
+          setTimeout(function () {
+            if (statusEl.textContent === '已取消') {
+              statusEl.textContent = '';
+            }
+          }, 0);
+        });
+      }
+    });
+  })();
+</script>
+</body>
+</html>

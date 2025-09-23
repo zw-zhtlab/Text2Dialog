@@ -1,0 +1,8 @@
+openai
+tiktoken
+tqdm
+python-dotenv
+fastapi
+uvicorn
+pydantic
+python-multipart

@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Text2Dialog · 帮助文档</title>
+  <style>
+    :root{
+      --bg:#f7f8fa; --paper:#fff; --ink:#0f1216; --muted:#606773; --line:#e7e9ef;
+      --accent:#1b1e24; --ok:#0a7f3f; --warn:#b36b00; --err:#b00020;
+      --radius:14px;
+    }
+    html,body{margin:0;padding:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Noto Sans SC","PingFang SC","Microsoft Yahei",sans-serif;background:var(--bg);color:var(--ink);}
+    a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline;}
+    .page{max-width:1000px;margin:32px auto;padding:0 16px 40px;}
+    .hero{background:var(--paper);border:1px solid var(--line);border-radius:var(--radius);padding:28px 24px;margin-bottom:20px;}
+    .hero h1{margin:0 0 6px 0;font-size:28px}
+    .hero p{margin:6px 0;color:var(--muted)}
+    .toc{background:var(--paper);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin:18px 0;}
+    .toc h3{margin:0 0 8px 0;font-size:16px}
+    .toc ol{margin:0 0 0 20px;padding:0;line-height:1.9}
+    section{background:var(--paper);border:1px solid var(--line);border-radius:var(--radius);padding:22px;margin-top:16px}
+    h2{margin:0 0 12px 0;font-size:22px}
+    h3{margin:18px 0 8px 0;font-size:18px}
+    .note{background:#f1f5ff;border:1px solid #d9e2ff;color:#1e3a8a;border-radius:12px;padding:10px 12px;}
+    .warn{background:#fff7ed;border:1px solid #ffedd5;color:#7c2d12;border-radius:12px;padding:10px 12px;}
+    .ok{color:var(--ok)} .err{color:var(--err)} .muted{color:var(--muted)} .center{text-align:center}
+    .grid{display:grid;gap:12px}
+    .g-2{grid-template-columns:repeat(2,minmax(0,1fr));}
+    .g-3{grid-template-columns:repeat(3,minmax(0,1fr));}
+    .card{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:12px}
+    .kbd{display:inline-block;border:1px solid var(--line);border-radius:8px;padding:2px 6px;background:#fafbff}
+    details{border:1px dashed var(--line);border-radius:10px;padding:12px;margin:10px 0;background:#fcfcfe}
+    summary{cursor:pointer;font-weight:600}
+    table{border-collapse:collapse;width:100%;margin:8px 0 2px 0}
+    th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+    th{background:#fbfcff}
+    code{background:#f6f7fa;border:1px solid var(--line);border-radius:6px;padding:2px 4px}
+    .step{display:flex;gap:12px;margin:14px 0}
+    .step-num{flex:0 0 28px;height:28px;border-radius:50%;background:#111;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700}
+    .kbd-line{display:flex;gap:6px;flex-wrap:wrap}
+    .q{font-weight:600}
+    footer{font-size:12px;margin-top:20px}
+    @media (max-width: 760px){ .g-2,.g-3{grid-template-columns:1fr} }
+  </style>
+</head>
+<body>
+<div class="page">
+  <div class="hero">
+    <h1>Text2Dialog 使用帮助</h1>
+    <p>把长文本（如小说、剧本）一键转成“角色对话数据集”，并导出为 <b>ChatML</b> 格式，用于微调/对话建模。</p>
+  </div>
+
+  <div class="toc">
+    <h3>目录</h3>
+    <ol>
+      <li><a href="#what">它能做什么</a></li>
+      <li><a href="#need">准备工作</a></li>
+      <li><a href="#quick">快速上手</a></li>
+      <li><a href="#run">如何启动程序（3种方式）</a></li>
+      <li><a href="#ui">界面与操作流程</a></li>
+      <li><a href="#export">如何导出 ChatML</a></li>
+      <li><a href="#files">文件保存位置</a></li>
+      <li><a href="#tips">效果调优小贴士</a></li>
+      <li><a href="#faq">常见问题（FAQ）</a></li>
+      <li><a href="#trouble">故障排查</a></li>
+    </ol>
+  </div>
+
+  <section id="what">
+    <h2>它能做什么</h2>
+    <ul>
+      <li>自动从长文本中识别角色与台词，生成“谁对谁说了什么”的结构化结果。</li>
+      <li>可根据角色自动配对出 <span class="kbd">A → B</span> 和 <span class="kbd">B → A</span> 的训练样本。</li>
+      <li>一键导出为 <b>ChatML</b>（每行是 <code>messages</code>），可直接用于监督微调（SFT）。</li>
+      <li>提供可视化网页控制台 + 图形化启动器，操作简单。</li>
+    </ul>
+    <div class="note">术语小解释：<br>
+      <b>JSONL</b>：每行一个 JSON 对象的文本文件，体积小、易处理。<br>
+      <b>ChatML</b>：常见的对话训练格式，每条样本包含 <code>system</code>、<code>user</code>、<code>assistant</code> 三段。</div>
+  </section>
+
+  <section id="need">
+    <h2>准备工作</h2>
+    <div class="grid g-2">
+      <div class="card">
+        <h3>电脑环境</h3>
+        <ul>
+          <li>Windows、macOS 或 Linux</li>
+          <li>Python 3.9 及以上（推荐 3.10~3.12）</li>
+          <li>能访问所选大模型服务的网络</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>模型服务（任选其一）</h3>
+        <p>支持多家平台。你只需要其中一家平台的 <b>API Key</b>：</p>
+        <ul>
+          <li>OpenAI</li>
+          <li>Siliconflow（硅基流动）</li>
+          <li>Moonshot Kimi</li>
+          <li>Google Gemini</li>
+          <li>DeepSeek</li>
+          <li>Qwen（阿里）</li>
+          <li>AWS Bedrock</li>
+        </ul>
+        <p class="muted">也可在高级选项里填写统一 <b>Base URL</b>（OpenAI 兼容接口）。</p>
+      </div>
+    </div>
+    <div class="warn"><b>隐私提示：</b>文本会发送到你选择的模型平台处理。请不要上传含有敏感信息的文件。</div>
+  </section>
+
+  <section id="quick">
+    <h2>快速上手</h2>
+    <div class="step"><div class="step-num">1</div><div>
+      解压压缩包，双击 <span class="kbd">launcher.py</span>（图形启动器）。
+    </div></div>
+    <div class="step"><div class="step-num">2</div><div>
+      点击 <b>① 一键配置/修复环境</b>，等待依赖安装完成。
+    </div></div>
+    <div class="step"><div class="step-num">3</div><div>
+      点击 <b>保存 API 配置(.env)</b>，把你有的 <b>API Key</b> 填进去并保存。（这一步是可选的，也可以跳过此步，在控制台中进行配置。）
+    </div></div>
+    <div class="step"><div class="step-num">4</div><div>
+      点击 <b>② 启动服务</b> → 再点 <b>打开界面</b>，浏览器会打开控制台。
+    </div></div>
+    <div class="step"><div class="step-num">5</div><div>
+      把文本文件拖进页面上方的“上传文本”区域（或点“选择文件”）。
+    </div></div>
+    <div class="step"><div class="step-num">6</div><div>
+      点 <b>开始提取</b>。完成后依次点 <b>校验</b> → <b>生成角色对</b> → <b>生成 ChatML</b>，最后下载文件即可。
+    </div></div>
+  </section>
+
+  <section id="run">
+    <h2>如何启动程序（3种方式）</h2>
+    <h3>方式 A：图形启动器（推荐）</h3>
+    <ol>
+      <li>双击项目根目录中的 <span class="kbd">launcher.py</span>。</li>
+      <li>点 <b>① 一键配置/修复环境</b>：自动创建 <code>.venv</code> 并安装依赖。</li>
+      <li>点 <b>保存 API 配置(.env)</b>：按需填写 OpenAI、Kimi、Gemini、DeepSeek、Qwen、Bedrock 的密钥。可选填写“统一 Base URL”。</li>
+      <li>在“运行设置”里可修改 <b>Host</b> 与 <b>Port</b>（默认 <code>127.0.0.1:8000</code>）。</li>
+      <li>点 <b>② 启动服务</b> → 状态变为“运行中”后，点 <b>打开界面</b>。</li>
+    </ol>
+    <details><summary>界面按钮一览</summary>
+      <table>
+        <tr><th>按钮</th><th>作用</th></tr>
+        <tr><td>① 一键配置/修复环境</td><td>创建虚拟环境并安装依赖</td></tr>
+        <tr><td>② 启动服务</td><td>启动后台服务</td></tr>
+        <tr><td>停止服务</td><td>停止后台服务</td></tr>
+        <tr><td>打开控制台</td><td>查看/复制日志</td></tr>
+        <tr><td>打开界面</td><td>在浏览器打开网页控制台</td></tr>
+        <tr><td>保存 API 配置(.env)</td><td>填写/保存各平台的 API Key（随时可改）</td></tr>
+        <tr><td>帮助文档</td><td>打开本页</td></tr>
+      </table>
+    </details>
+
+    <h3>方式 B：一键脚本</h3>
+    <ul>
+      <li>Windows：双击 <span class="kbd">run_server.bat</span></li>
+      <li>macOS / Linux：在终端中执行 <span class="kbd">bash run_server.sh</span></li>
+    </ul>
+
+    <h3>方式 C：手动（熟悉命令行的用户）</h3>
+    <ol>
+      <li>创建并激活虚拟环境，安装依赖：<br>
+        <code>pip install -r text2dialog/requirements.txt</code></li>
+      <li>进入 <span class="kbd">Text2Dialog/text2dialog</span> 目录，启动：<br>
+        <code>uvicorn server:app --host 0.0.0.0 --port 8000</code></li>
+    </ol>
+    <p class="muted">浏览器访问：<code>http://127.0.0.1:8000/static/index.html</code>。</p>
+  </section>
+
+  <section id="ui">
+    <h2>界面与操作流程</h2>
+
+    <h3>① 上传文本</h3>
+    <ul>
+      <li>直接把 <b>.txt / .md</b> 文本拖到“上传文本”区域，或点击“选择文件”。</li>
+      <li>文件越干净越好（建议去掉目录、注释、无关广告）。</li>
+    </ul>
+
+    <h3>② 运行设置（常用项）</h3>
+    <table>
+      <tr><th>设置项</th><th>含义与建议</th></tr>
+      <tr><td>平台（Platform）</td><td>选择你已开通的平台，如 OpenAI / Kimi / Gemini / DeepSeek / Qwen / Bedrock。</td></tr>
+      <tr><td>模型名称（Model）</td><td>指定使用模型。如未填写，将使用默认配置。</td></tr>
+      <tr><td>API Key</td><td>填入你的密钥；也可在启动器里统一保存到 <code>.env</code>。</td></tr>
+      <tr><td>Base URL</td><td>仅在使用自建代理或第三方兼容接口时填写。</td></tr>
+      <tr><td>并发请求数</td><td>一次同时发出的请求数量，网络与配额允许时可适当提高。</td></tr>
+      <tr><td>温度（Temperature）</td><td>越高越“发散”；一般保持默认即可。</td></tr>
+      <tr><td>最大输出长度</td><td>限制每次模型生成的最大字数（令牌数）。</td></tr>
+      <tr><td>按原文排序输出</td><td>开启后，提取结果将按原文顺序整理，更便于人工查看。</td></tr>
+      <tr><td>保存分段文本</td><td>用于调试与复查，会让文件更大。</td></tr>
+      <tr><td>上下文窗口（回复窗口）</td><td>为判断说话对象，允许参考前后句。越大越准，但更费时。</td></tr>
+    </table>
+
+    <h3>③ 开始提取</h3>
+    <ol>
+      <li>点击 <b>开始提取</b>，状态区会显示进度与日志。</li>
+      <li>可在任务进行中选择 <b>暂停</b> / <b>继续</b> / <b>停止</b>（停止会尽量安全终止）。</li>
+      <li>完成后，可点击 <b>下载提取结果</b>（JSONL）。</li>
+    </ol>
+
+    <h3>④ 校验结果</h3>
+    <p>点击 <b>校验</b>。成功会在后台生成一份校验后的副本，供后续步骤使用。</p>
+
+    <h3>⑤ 生成“角色对”样本</h3>
+    <table>
+      <tr><th>选项</th><th>说明</th></tr>
+      <tr><td>最小置信度</td><td>默认 <code>0.8</code>。越低包含样本越多，但可能更嘈杂。</td></tr>
+      <tr><td>严格模式</td><td>仅保留方向明确的 <span class="kbd">A → B</span>，噪声更少。</td></tr>
+      <tr><td>必须有置信度</td><td>缺失置信度的样本会被丢弃，保证数据可控。</td></tr>
+      <tr><td>最小/最大字数</td><td>可剔除太短/太长的句子。</td></tr>
+      <tr><td>排除模式</td><td>按关键词（如“旁白”“舞台提示”）过滤不希望出现的句子。</td></tr>
+    </table>
+    <p>点击 <b>生成角色对</b> 后，会得到一个按角色对拆分的文件夹，并自动打包为 <code>pairs.zip</code>。</p>
+  </section>
+
+  <section id="export">
+    <h2>如何导出 ChatML</h2>
+    <table>
+      <tr><th>选项</th><th>说明</th></tr>
+      <tr><td>最小置信度</td><td>转换时再次设定阈值，常与上一步保持一致。</td></tr>
+      <tr><td>最大轮数</td><td>把相邻的多句合并成多轮对话（例如 1~3 轮）。</td></tr>
+      <tr><td>去重</td><td>移除重复的样本行。</td></tr>
+      <tr><td>反向</td><td>交换问答方向（少数场景使用）。</td></tr>
+      <tr><td>附加元信息</td><td>在每行附带来源信息，便于回溯。</td></tr>
+      <tr><td>系统提示（可选）</td><td>为数据集统一添加一段 <code>system</code> 提示文字。</td></tr>
+    </table>
+    <p>点击 <b>生成 ChatML</b> → <b>下载 chatml.jsonl</b> 即可。</p>
+  </section>
+
+  <section id="files">
+    <h2>文件保存位置</h2>
+    <p>所有临时与产出文件都在项目目录下的 <code>Text2Dialog/text2dialog/jobs/</code> 里，以任务编号区分：</p>
+    <ul>
+      <li><code>input.txt</code>：你上传的原始文本（副本）</li>
+      <li><code>extraction.jsonl</code>（以及 <code>extraction.validated.jsonl</code>）：对话提取结果</li>
+      <li><code>pair_datasets/</code>：按“角色对”拆分的样本与合并文件；并提供 <code>pairs.zip</code></li>
+      <li><code>chatml.jsonl</code>：最终的 ChatML 数据集</li>
+      <li><code>job.json</code>：任务状态</li>
+    </ul>
+  </section>
+
+  <section id="tips">
+    <h2>效果调优小贴士</h2>
+    <ul>
+      <li><b>文本越干净越好：</b>去掉目录、注释、脚注、网页残留内容。</li>
+      <li><b>适度提高置信度阈值：</b>如果样本质量不稳定，把“最小置信度”调高一些。</li>
+      <li><b>增大“回复窗口”：</b>模型可参考更多上下文，更容易判断说话对象。但是也请注意你所选择的模型所支持的上下文长度，“回复窗口”太大可能会造成性能下降。</li>
+      <li><b>更换模型：</b>尝试更强或更适合中文/你文本风格的模型。</li>
+      <li><b>逐步处理：</b>特别长的文本可按章节拆分，多次导出后再合并。</li>
+    </ul>
+  </section>
+
+  <section id="faq">
+    <h2>常见问题（FAQ）</h2>
+
+    <details><summary><span class="q">Q1：我没有编程基础，也能用吗？</span></summary>
+      <p>可以。用 <b>图形启动器</b>（双击 <code>launcher.py</code>）即可全程点击操作。</p>
+    </details>
+
+    <details><summary><span class="q">Q2：API Key 一定要填吗？</span></summary>
+      <p>是的。本工具需要调用大模型来识别“谁在对谁说话”。选择你已有账号的平台，填入对应的 API Key 即可。</p>
+    </details>
+
+    <details><summary><span class="q">Q3：浏览器打不开界面怎么办？</span></summary>
+      <ul>
+        <li>确认启动器中已点过 <b>② 启动服务</b> 且状态为“运行中”。</li>
+        <li>尝试访问地址：<code>http://127.0.0.1:8000/static/index.html</code>。</li>
+        <li>检查公司/校园网络的安全软件是否拦截了本地端口。</li>
+        <li>如被占用，可在启动器的“运行设置”里修改 <b>Port</b>（例如 8001）。</li>
+      </ul>
+    </details>
+
+    <details><summary><span class="q">Q4：提取结果几乎为空？</span></summary>
+      <ul>
+        <li>把“最小置信度”先调低一些（例如 0.6）。</li>
+        <li>根据情况增大或缩小“回复窗口”。</li>
+        <li>换一个更擅长该语料的模型。</li>
+      </ul>
+    </details>
+
+    <details><summary><span class="q">Q5：下载按钮是灰色的？</span></summary>
+      <p>只有当对应步骤完成后，下载按钮才会变为可用。请先完成上一步（例如先“校验”，再“生成角色对”）。</p>
+    </details>
+
+    <details><summary><span class="q">Q6：生成 ChatML 报错？</span></summary>
+      <ul>
+        <li>确保已经完成“生成角色对”。</li>
+        <li>把转换时的“最小置信度”适当降低。</li>
+        <li>如果你自定义了系统提示，请确认文本不要过长。</li>
+      </ul>
+    </details>
+
+    <details><summary><span class="q">Q7：我的文本很大，程序会卡住吗？</span></summary>
+      <p>处理超长文本时，时间会变久。可以分章节多次处理，最后把多个导出的 <code>chatml.jsonl</code> 合并即可。</p>
+    </details>
+
+    <details><summary><span class="q">Q8：输出文件在哪里？</span></summary>
+      <p>在项目的 <code>Text2Dialog/text2dialog/jobs/&lt;任务编号&gt;/</code> 内。也可在网页上直接点击“下载”。</p>
+    </details>
+
+    <details><summary><span class="q">Q9：怎样清理历史任务？</span></summary>
+      <p>关闭服务后，删除 <code>jobs</code> 文件夹下旧的任务编号目录即可。</p>
+    </details>
+
+  </section>
+
+  <section id="trouble">
+    <h2>故障排查</h2>
+    <h3>启动相关</h3>
+    <ul>
+      <li><b>依赖安装失败：</b>再次点击“① 一键配置/修复环境”。如仍失败，检查网络或换一台能访问模型平台的网络环境。</li>
+      <li><b>端口被占用：</b>启动器里把 <b>Port</b> 改为 8001/8002 等。</li>
+      <li><b>打不开网页：</b>安全软件可能拦截本地端口；添加信任或临时关闭再试。</li>
+    </ul>
+
+    <h3>调用模型相关</h3>
+    <ul>
+      <li><b>认证失败：</b>核对 API Key 是否正确，并确认所选平台与密钥匹配。</li>
+      <li><b>超时/限流：</b>降低并发请求数；稍后再试。</li>
+      <li><b>响应异常：</b>更换模型或切换到其它平台测试。</li>
+    </ul>
+
+    <h3>结果相关</h3>
+    <ul>
+      <li><b>角色识别不准：</b>提高“回复窗口”；或在“最小/最大字数”里剔除噪声句子；必要时更换模型。</li>
+      <li><b>样本过少：</b>降低“最小置信度”；缩小“回复窗口”。</li>
+      <li><b>文件过大：</b>取消“保存分段文本”；或分批生成再合并。</li>
+    </ul>
+  </section>
+
+  <footer class="muted center">Text2Dialog v0.1.0 · MIT · <a href="https://github.com/zw-zhtlab/Text2Dialog">GitHub</a></footer>
+</div>
+</body>
+</html>
