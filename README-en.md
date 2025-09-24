@@ -1,5 +1,9 @@
 # Text2Dialog
 
+**文档语言 / Languages / 言語**：
+[简体中文](./README.md) · [English](./README-en.md) · [日本語](./README-ja.md)
+
+
 > Automatically extract long-form text (e.g., novels, screenplays, nonfiction) into structured **character dialogues + reply links**, and complete **quality validation → role pairing → ChatML dataset export** in one click. Provides a command line tool, FastAPI service, and a visual frontend (with a one‑click launcher).
 
 <p align="center">
