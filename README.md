@@ -155,7 +155,7 @@ LLM_PLATFORM=siliconflow
 OPENAI_API_KEY="sk-..."
 LLM_PLATFORM=openai
 ```
-> 前端“高级设置”亦支持**临时覆盖**（平台、API Key、BaseURL、模型名），仅对本次作业生效。
+> 前端操作台界面亦支持**临时覆盖**（平台、API Key、BaseURL、模型名），仅对本次作业生效。
 
 ---
 
