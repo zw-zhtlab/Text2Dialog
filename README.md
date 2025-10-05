@@ -1,10 +1,6 @@
 # Text2Dialog
 
-**文档语言 / Languages / 言語**：
-[简体中文](./README.md) · [English](./README-en.md) · [日本語](./README-ja.md)
-
-
-> 将长文本（如小说、剧本、纪实文本）自动抽取为结构化的**角色对话 + 引用关系**，并一键完成**质量校验 → 角色对配对 → ChatML 数据集导出**。提供命令行、FastAPI 服务与可视化前端（含一键启动器）。
+> 将长文本（如小说、剧本、纪实文本）自动抽取为结构化的**角色对话和引用关系**，并一键完成**质量校验 → 角色对配对 → ChatML 数据集导出**。提供命令行、FastAPI 服务与可视化前端（含一键启动器）。
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-blue" />
@@ -155,7 +151,7 @@ LLM_PLATFORM=siliconflow
 OPENAI_API_KEY="sk-..."
 LLM_PLATFORM=openai
 ```
-> 前端操作台界面亦支持**临时覆盖**（平台、API Key、BaseURL、模型名），仅对本次作业生效。
+> 前端“高级设置”亦支持**临时覆盖**（平台、API Key、BaseURL、模型名），仅对本次作业生效。
 
 ---
 
