@@ -4,7 +4,7 @@
 [简体中文](./README.md) · [English](./README-en.md) · [日本語](./README-ja.md)
 
 
-> Automatically extract long-form text (e.g., novels, screenplays, nonfiction) into structured **character dialogues + reply links**, and complete **quality validation → role pairing → ChatML dataset export** in one click. Provides a command line tool, FastAPI service, and a visual frontend (with a one‑click launcher).
+> Automatically extract long-form text (e.g., novels, screenplays, nonfiction) into structured **character dialogues with reply links**, and complete **quality validation → role pairing → ChatML dataset export** in one click. Provides a command line tool, FastAPI service, and a visual frontend (with a one‑click launcher).
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-blue" />
