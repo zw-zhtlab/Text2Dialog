@@ -439,7 +439,7 @@ python text2dialog/dialogue_chain.py input.txt -o extraction.jsonl --concurrent 
 flowchart LR
   A[上传 .txt] -->|/api/jobs/create| B{jobId}
   B --> C[设置参数 & 开始提取]
-  C -->|/api/jobs/{id}/extract| D[运行中]
+  C -->|/api/jobs/:id/extract| D[运行中]
   D -->|轮询 /progress| E{状态?}
   E -->|succeeded| F[预览与统计]
   F -->|/api/validate| G{校验}
