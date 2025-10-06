@@ -290,16 +290,189 @@ python text2dialog/dialogue_chain.py input.txt -o extraction.jsonl --concurrent 
 
 ---
 
-## 7. 前端使用要点（可视化控制台）
+## 7. 前端操作台
 
-- **上传文本** → **运行设置**（平台/Key/模型/并发/高级参数）→ **开始提取**。
-- 实时查看**进度**（已处理块、速度、ETA），支持**暂停/继续/取消**。
-- **校验**后可预览抽取片段与**统计信息**（总数、角色分布、平均长度等）。
-- **生成配对数据**（可显式 `pairs` 或基于角色全集 `all_ordered_pairs`）。
-- **导出 ChatML**（选择 `pair` / `stitch`、是否去重/反转、系统消息等）。
-- 一键下载：`extraction.jsonl`、`pairs.zip`、`chatml.jsonl`。
+### 7.1 本地运行与联调
 
----
+- 前端位于 `text2dialog/static/`（`index.html / app.js / style.css`），由 FastAPI 直接提供静态资源。
+- 推荐联调步骤：
+  ```bash
+  # 安装依赖并启动服务
+  pip install -r text2dialog/requirements.txt
+  uvicorn text2dialog.server:app --host 0.0.0.0 --port 8000
+
+  # 浏览器访问
+  http://localhost:8000
+  ```
+- 前端所有 API 调用使用 **同源相对路径**（如 `/api/jobs/{id}/progress`）。  
+  如需前后端分离部署，请在网关将 `/api/*` 转发到 FastAPI；或在 `app.js` 的 `api()` 中增加可配置的后端基址与 CORS 支持。
+
+### 7.2 页面结构与主流程
+
+界面围绕一个作业（Job）完成从上传到导出的五步主流程：
+
+1. **上传文本**：拖拽或选择 `.txt`，创建作业 `job_id`。  
+2. **运行设置**：选择平台/模型，配置抽取参数（并发、温度、Token 上限、回溯窗口等）。  
+3. **开始提取**：后端执行抽取，前端**轮询进度**并展示 ETA。  
+4. **校验与预览**：触发输出校验，预览前若干条结果与**角色分布统计**。  
+5. **构建数据集并导出**：生成**角色有向对**（pairs），再导出 **ChatML**（`pair`/`stitch` 两种模式）。
+
+控件与状态区：
+- 运行控制：`开始提取（run）`、`暂停（pause）`、`继续（resume）`、`取消（cancel）`  
+- 进度：原生 `<progress>`（`#bar`）+ 状态文本（`#status`）
+
+### 7.3 DOM 锚点（关键控件 ID）
+
+**基础设置**
+- `#platform`（平台） · `#modelName`（模型名，可空） · `#baseUrl`（API Base URL，可空） · `#apiKey`（API Key）
+
+**高级参数（`<details>` 折叠）**
+- `#concurrent`（并发开关） · `#threads`（线程数）
+- `#temperature` · `#maxTokenLen` · `#coverContent`
+- `#saveChunkText`（保存 chunk 原文） · `#sortOutput`（按 `chunk_id` 排序写回）
+- `#replyWindow`（回溯窗口） · `#replyConf`（置信度阈值）
+
+**校验/预览**
+- `#validate`（执行校验） · `#validateLog`（校验日志） · `#downloadExtract`（下载抽取结果）
+- `#preview`（预览前若干条）
+- 统计：`#statsCard`、`#statTotal`、`#statRoles`、`#statAvg`、`#roleBars`、`#toggleRoles`
+
+**配对与导出**
+- `#pairs`（手动指定角色对；留空=全集有序对） · `#minConfidence` · `#strict` · `#requireConf`
+- `#downloadPairs`（下载 `pairs.zip`）
+- `#mode`（`pair|stitch`） · `#maxTurns` · `#chatmlMinConf` · `#dedupe` · `#reverse` · `#systemText`
+- `#buildChatML`、`#downloadChatML`
+
+**控制与主题**
+- `#run`、`#pause`、`#resume`、`#cancel` · 进度 `#bar` 与 `#status`
+- 主题：`#themeSelect`（`localStorage['t2d-theme'] = "dark" | "light-doc"`）
+
+### 7.4 `app.js` 架构与关键流程
+
+- 采用顶层 IIFE 与少量工具函数（`$()`、`api()`）组织代码；避免全局变量污染。
+- **核心状态**：`jobId`、`defaults`（从后端拉取的默认参数）、`pollTimer`（进度轮询）。
+- **关键函数**
+  - `init()`：初始化 UI，`GET /api/defaults` 拉取平台列表与默认参数（若提供），设置初始禁用态。
+  - `upload(file)`：`POST /api/jobs/create` 创建作业；成功后启用“开始提取”。
+  - `run()`：收集表单参数并 `POST /api/jobs/{jobId}/extract`；置为“运行中”并启动 `poll()`。
+  - `control(action)`：`POST /api/jobs/{jobId}/control`（`pause|resume|cancel`）。
+  - `poll()`：`GET /api/jobs/{jobId}/progress`，渲染进度与状态；终态时启用校验/下载并加载统计。
+  - `validate()`：`POST /api/validate`，输出校验日志。
+  - `buildPairs()`：`POST /api/pairs` 生成有向对数据集；成功后可下载。
+  - `buildChatML()`：`POST /api/chatml` 导出 ChatML，并启用下载按钮。
+
+
+### 7.5 状态机与按钮联动
+
+`status ∈ { running, paused, cancelling, cancelled, succeeded, failed, done }`
+
+- `running`：启用“暂停/取消”，禁用“继续”。  
+- `paused`：启用“继续/取消”，禁用“暂停”。  
+- `cancelling`：禁用全部交互，等待终态。  
+- 终态（`cancelled/succeeded/failed/done`）：停止轮询，启用下载与后续步骤。
+
+> 轮询节奏建议 **1200–1500ms**，异常自动退避；终态或明显错误时停止。
+
+### 7.6 样式与主题（`style.css`）
+
+- **设计令牌**：颜色、阴影、圆角、间距均通过 CSS Variables（如 `--bg-0`、`--text`、`--line`、`--radius-*`）管理。
+- **布局与组件**：`.container`、`.card`、`.grid.two/.grid.three`、`.button/.primary`、`.dropzone`、`.kpi`。
+- **主题切换**：`<html data-theme="dark|light-doc">` + `color-scheme`；滚动条/进度条/焦点环统一覆盖。
+- **可访问性**：表单焦点 `:focus` 可见；控件具备禁用与悬停态；上传区域具备语义与 `aria-*` 属性。
+
+### 7.7 前端视角下的 API 契约
+
+> 下列体例基于前端使用的字段集合，需与后端保持一致；若后端调整，请同步更新表单与 `app.js` 的请求体组装。
+
+- `GET /api/defaults` → `{ platforms: Record<string,string>, config: {...} }`（用于初始化平台列表与默认值）
+- `POST /api/jobs/create`（`FormData{ file }`）→ `{ job_id }`
+- `POST /api/jobs/{job_id}/extract`  
+  典型请求体字段：
+  ```json
+  {
+    "platform": "openai|deepseek|...|custom",
+    "api_key": "sk-...",
+    "base_url": "https://.../v1",
+    "model_name": "gpt-4o-mini",
+    "concurrent": true,
+    "threads": 8,
+    "save_chunk_text": false,
+    "sort_output": false,
+    "MAX_TOKEN_LEN": 1000,
+    "COVER_CONTENT": 100,
+    "TEMPERATURE": 0.6,
+    "REPLY_WINDOW": 6,
+    "REPLY_CONFIDENCE_TH": 0.65
+  }
+  ```
+- `GET /api/jobs/{job_id}/progress` → `{ status, progress:{ processed,total,eta_sec,stage }, message }`
+- `POST /api/jobs/{job_id}/control` → `{ ok: true }`
+- `POST /api/validate` → `{ ok, log }`
+- `POST /api/pairs` → `{ ok, out_dir, zip }`（支持 `pairs / roles / all_ordered_pairs / min_confidence / require_confidence / strict`）
+- `POST /api/chatml` → `{ ok, out }`（`mode: "pair"|"stitch"`, 支持 `reverse / min_confidence / dedupe / system_text`）
+- 下载：`GET /api/jobs/{job_id}/download?which=extraction|pairs_zip|chatml`
+
+### 7.8 扩展与二次开发建议
+
+- **新增运行参数**（例：`replyTopK`）  
+  1) 在 `index.html` 添加控件与唯一 `id`；2) 在 `run()` 组装请求体；3) 后端数据模型与逻辑新增对应字段。
+- **新增统计卡片**：后端在 `stats` 增加指标 → `renderStats(stats)` 渲染并复用 `.kpi`。
+- **轮询策略**：按数据量/平台限速调整轮询间隔；`paused/cancelling` 可延长。
+- **独立部署**：通过 Nginx/反代将 `/api/*` 透传到后端；或在前端配置可变 `base_url` 与 CORS。
+
+### 7.9 错误处理与常见问题
+
+- **初始化失败（`/api/defaults`）**：确认服务已启动；跨域/路径问题请检查代理配置或 `api()` 基址。
+- **上传失败**：检查文件类型与大小限制；查看后端返回与浏览器控制台。
+- **控制失效**：`pause/resume/cancel` 后无变化，多为轮询未刷新或状态未落盘；可直接查询 `/api/jobs/{id}`。
+- **下载置灰**：需等待阶段产物就绪，并由前端设置 `href`（如 `which=extraction`）。
+
+### 7.10 代码风格与约定
+
+- 使用 ES2015+，小函数化；事件监听在 `DOMContentLoaded` 后统一绑定。
+- 以 `#id` 作为绑定锚点；新增控件确保 `id` 唯一。
+- 零第三方依赖；如需图表优先使用原生控件/轻量实现。
+
+### 7.11 前端流程示意（Mermaid）
+
+```mermaid
+flowchart LR
+  A[上传 .txt] -->|/api/jobs/create| B{jobId}
+  B --> C[设置参数 & 开始提取]
+  C -->|/api/jobs/{id}/extract| D[运行中]
+  D -->|轮询 /progress| E{状态?}
+  E -->|succeeded| F[预览与统计]
+  F -->|/api/validate| G{校验}
+  G --> H[生成 pairs (/api/pairs)]
+  H --> I[下载 pairs.zip]
+  I --> J[导出 ChatML (/api/chatml)]
+  J --> K[下载 chatml.jsonl]
+  E -->|paused/resume| D
+  E -->|cancelled/failed| X[终态]
+```
+
+### 7.12 自测清单（建议）
+
+- 上传：拖拽/文件选择、空文件/非法类型提示。  
+- 运行：并发/单线程、参数边界（温度/阈值/窗口/Token 上限）。  
+- 控制：暂停→继续、取消→终态 UI。  
+- 预览：JSON 解析失败的容错（逐条 try/catch）。  
+- 统计：Top 角色与“展开全部”的开合。  
+- pairs：留空=全集有序对、指定子集、阈值过滤、严格/非严格模式。  
+- ChatML：`pair/stitch`、`reverse/dedupe`、`system_text`（文本或模板）。  
+- 下载：三个下载按钮在正确阶段可用，文件名与产物一致性校验。
+
+### 7.13 已知可优化点
+
+- `max_turns/dedupe/system_text` 等字段在部分后端版本可能**未消费**；需与后端数据模型对齐。  
+- 轮询使用 `setTimeout` 简化实现，可引入退避/抖动与错误重试策略。  
+- 未来可拆分为 ES Modules，以提升可维护性与可测试性。
+
+### 7.14 参考（前端相关文件）
+
+- 主页：`text2dialog/static/index.html`  
+- 脚本：`text2dialog/static/app.js`  
+- 样式：`text2dialog/static/style.css`
 
 ## 8. 关键参数与调优建议
 
@@ -313,7 +486,7 @@ python text2dialog/dialogue_chain.py input.txt -o extraction.jsonl --concurrent 
 
 ---
 
-## 9. 二次开发指南
+## 9. 项目二次开发指南
 
 ### 9.0 场景导览与最佳路径
 - **离线批处理**（TB 级语料）：CLI/REST + 并发抽取 + 断点续跑 + 分区落地 → 夜间作业。
