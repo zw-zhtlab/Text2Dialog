@@ -438,17 +438,17 @@ python text2dialog/dialogue_chain.py input.txt -o extraction.jsonl --concurrent 
 ```mermaid
 flowchart LR
   A[上传 .txt] -->|/api/jobs/create| B{jobId}
-  B --> C[设置参数 & 开始提取]
+  B --> C[设置参数与开始提取]
   C -->|/api/jobs/:id/extract| D[运行中]
   D -->|轮询 /progress| E{状态?}
   E -->|succeeded| F[预览与统计]
-  F -->|/api/validate| G{校验}
-  G --> H[生成 pairs (/api/pairs)]
+  F -->|/api/validate| G[校验]
+  G --> H[生成 pairs /api/pairs]
   H --> I[下载 pairs.zip]
-  I --> J[导出 ChatML (/api/chatml)]
+  I --> J[导出 ChatML /api/chatml]
   J --> K[下载 chatml.jsonl]
-  E -->|paused/resume| D
-  E -->|cancelled/failed| X[终态]
+  E -->|paused 或 resume| D
+  E -->|cancelled 或 failed| X[终态]
 ```
 
 ### 7.12 自测清单（建议）
