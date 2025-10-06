@@ -1,5 +1,8 @@
 # Text2Dialog
 
+**文档语言 / Languages / 言語**：
+[简体中文](./README.md) · [English](./README-en.md) · [日本語](./README-ja.md)
+
 > 将长文本（如小说、剧本、纪实文本）自动抽取为结构化的**角色对话和引用关系**，并一键完成**质量校验 → 角色对配对 → ChatML 数据集导出**。提供命令行、FastAPI 服务与可视化前端（含一键启动器）。
 
 <p align="center">
