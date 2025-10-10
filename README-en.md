@@ -1,4 +1,4 @@
-# Text2Dialog
+# Text2Dialog: Converting Long Texts into Trainable Dialogue Data
 
 **文档语言 / Languages / 言語**：
 [简体中文](./README.md) · [English](./README-en.md) · [日本語](./README-ja.md)
