@@ -1,4 +1,4 @@
-# Text2Dialog
+# Text2Dialog：長文テキストを学習可能な対話データに変換する
 
 **文档语言 / Languages / 言語**：
 [简体中文](./README.md) · [English](./README-en.md) · [日本語](./README-ja.md)
