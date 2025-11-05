@@ -499,7 +499,8 @@ def build_pairs(req: PairBuildReq):
 
     argv: List[str] = ["--input", src, "--out", out_dir]
     if req.merge_out: argv = ["--input", src, "--merge-out", req.merge_out]
-    if req.pairs:  [argv.extend(["--pairs", p]) for p in req.pairs]
+    if req.pairs:
+        argv.extend(["--pairs"] + req.pairs)
 
     # 统一处理 roles，避免重复 --roles 导致 argparse 覆盖
     roles_args: List[str] = []
@@ -541,11 +542,15 @@ def build_pairs(req: PairBuildReq):
 class ChatMLReq(BaseModel):
     job_id: str
     input: Optional[str] = None
-    mode: Optional[str] = "from_role/to_role"  # 或 "from_role/to_role/src_role/tgt_role"
+    mode: Optional[str] = "pair"
     out: Optional[str] = None
-    min_confidence: Optional[float] = 0.8
+    min_confidence: Optional[float] = None
     reverse: Optional[bool] = False
     include_meta: Optional[bool] = False
+    max_turns: Optional[int] = None
+    dedupe: Optional[bool] = False
+    system_text: Optional[str] = None
+    system_template: Optional[str] = None
 
 @app.post("/api/chatml")
 def build_chatml(req: ChatMLReq):
@@ -558,11 +563,20 @@ def build_chatml(req: ChatMLReq):
     argv = [
         "-i", inputs,
         "-o", out,
-        "--mode", req.mode or "from_role/to_role",
-        "--min-confidence", str(req.min_confidence or 0.8),
+        "--mode", req.mode or "pair",
     ]
+    if req.min_confidence is not None:
+        argv.extend(["--min-confidence", str(req.min_confidence)])
+    if req.max_turns is not None:
+        argv.extend(["--max-turns", str(max(1, int(req.max_turns)))])
+    if req.dedupe:
+        argv.append("--dedupe")
     if req.reverse: argv.append("--reverse")
     if req.include_meta: argv.append("--include-meta")
+    if req.system_template:
+        argv.extend(["--system-template", req.system_template])
+    elif req.system_text:
+        argv.extend(["--system", req.system_text])
 
     code = p2c.main(argv)
     if code != 0:
