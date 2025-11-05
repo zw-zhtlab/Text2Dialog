@@ -526,9 +526,6 @@ def build_pairs(req: PairBuildReq):
     if code != 0: return {"ok": False, "log": "pair_dataset_builder: 非零退出"}
 
     zip_path = os.path.join(_job_dir(req.job_id), "pairs.zip")
-    merged_file = os.path.join(out_dir, "all_pairs.jsonl")
-    if os.path.exists(merged_file):
-        _update_job(req.job_id, artifacts={**_load_job(req.job_id)["artifacts"], "pairs_zip": zip_path})
     if os.path.exists(out_dir):
         # 简单打包
         import zipfile
@@ -537,6 +534,8 @@ def build_pairs(req: PairBuildReq):
                 for fn in files:
                     fp = os.path.join(root, fn)
                     zf.write(fp, arcname=os.path.relpath(fp, out_dir))
+    if os.path.exists(zip_path):
+        _update_job(req.job_id, artifacts={**_load_job(req.job_id)["artifacts"], "pairs_zip": zip_path})
     return {"ok": True, "out_dir": out_dir, "zip": zip_path}
 
 class ChatMLReq(BaseModel):
