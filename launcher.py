@@ -454,6 +454,8 @@ class Launcher:
             ("Moonshot Kimi", "MOONSHOT_API_KEY", ""),
             ("Google Gemini", "GEMINI_API_KEY", ""),
             ("DeepSeek", "DEEPSEEK_API_KEY", ""),
+            ("SiliconFlow", "SILICONFLOW_API_KEY", ""),
+            ("阿里百炼/通义", "DASHSCOPE_API_KEY", ""),
             ("Qwen/阿里", "QWEN_API_KEY", ""),
             ("AWS Bedrock", "AWS_BEDROCK_API_KEY", ""),
         ]

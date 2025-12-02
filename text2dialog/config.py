@@ -115,6 +115,7 @@ class Config:
     DEFAULT_CONCURRENT = True        # 默认使用多线程并发处理
     DEFAULT_SORT_OUTPUT = False      # 默认完成后按chunk_id排序输出
     DEFAULT_SAVE_CHUNK_TEXT = False  # 默认不保存原始chunk文本
+    FAIL_ON_PARSE_ERROR = False      # 解析模型响应失败时是否抛异常（默认记录并跳过）
 
     # 回复关系标注配置
     REPLY_WINDOW = 6                 # 仅本 chunk 内向前看的窗口大小
@@ -187,7 +188,7 @@ class Config:
 
     # Chunk-ID 配置
     INCLUDE_CHUNK_ID = True       # 是否在输出中包含chunk-id
-    SAVE_CHUNK_TEXT = True        # 是否保存原始chunk文本（默认开启）
+    SAVE_CHUNK_TEXT = DEFAULT_SAVE_CHUNK_TEXT  # 与 DEFAULT_SAVE_CHUNK_TEXT 保持一致的实际开关
     BUFFER_BEFORE_WRITE = True    # 是否缓冲结果后按顺序写入
 
     # 默认对话提取模式

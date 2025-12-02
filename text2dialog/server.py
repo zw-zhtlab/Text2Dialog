@@ -298,9 +298,17 @@ def _worker_extract(job_id: str, req_body: Dict[str, Any]) -> None:
         Config.CACHE_DIR = cache_dir
 
         out_file = os.path.join(_job_dir(job_id), "extraction.jsonl")
-        _update_job(job_id, status="running", message="正在提取对话……", cache_dir=cache_dir, artifacts={"extraction": out_file})
+        existing_artifacts = dict(_load_job(job_id).get("artifacts", {}))
+        existing_artifacts["extraction"] = out_file
+        _update_job(job_id, status="running", message="???????", cache_dir=cache_dir, artifacts=existing_artifacts)
 
-        extractor = DialogueChain(schema=None, max_workers=req_body.get("threads"), save_chunk_text=req_body.get("save_chunk_text"), cache_dir=cache_dir)
+        extractor = DialogueChain(
+            schema=None,
+            platform=req_body.get("platform") or os.getenv("LLM_PLATFORM"),
+            max_workers=req_body.get("threads"),
+            save_chunk_text=req_body.get("save_chunk_text"),
+            cache_dir=cache_dir,
+        )
 
         try:
             if req_body.get("concurrent", True):
@@ -585,22 +593,45 @@ def build_chatml(req: ChatMLReq):
     return {"ok": True, "out": out}
 
 def _all_roles_from_pairs(job_id: str) -> Dict[str, int]:
-    # 尝试从 pair_datasets 汇总角色
+    # 尝试从 pair_datasets 汇总角色；兼容旧/新字段
+    def _collect_roles(obj: Dict[str, Any]) -> List[str]:
+        roles: List[str] = []
+        # 优先使用标准的 pair: {"from": "...", "to": "..."}
+        pair = obj.get("pair")
+        if isinstance(pair, dict):
+            roles.extend([pair.get("from"), pair.get("to")])
+        # 兼容字段：source/reply 里的 role
+        src = obj.get("source")
+        if isinstance(src, dict):
+            roles.append(src.get("role"))
+        tgt = obj.get("reply")
+        if isinstance(tgt, dict):
+            roles.append(tgt.get("role"))
+        # 最后兜底旧字段
+        roles.extend([obj.get("from_role"), obj.get("to_role")])
+        return [r for r in roles if r]
+
     try:
         ds_dir = os.path.join(_job_dir(job_id), "pair_datasets")
-        if not os.path.isdir(ds_dir): return {}
+        if not os.path.isdir(ds_dir):
+            return {}
         from collections import Counter
+
         cnt = Counter()
         for root, _, files in os.walk(ds_dir):
             for fn in files:
-                if not fn.endswith(".jsonl"): continue
-                for line in open(os.path.join(root, fn), "r", encoding="utf-8"):
-                    try:
-                        obj = json.loads(line)
-                        a, b = obj.get("from_role"), obj.get("to_role")
-                        if a: cnt[a]+=1
-                        if b: cnt[b]+=1
-                    except Exception: pass
+                if not fn.endswith(".jsonl"):
+                    continue
+                fp = os.path.join(root, fn)
+                with open(fp, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            obj = json.loads(line)
+                            for role in _collect_roles(obj):
+                                cnt[role] += 1
+                        except Exception:
+                            # 忽略坏行，确保枚举不中断
+                            continue
         return dict(cnt.most_common())
     except Exception:
         return {}
@@ -616,10 +647,18 @@ def list_roles(job_id: str):
 # 静态资源
 @app.get("/static/{path:path}")
 def static_assets(path: str):
-    fp = os.path.join(STATIC_DIR, path)
-    if not os.path.exists(fp):
+    # 防止路径穿越：限制到 STATIC_DIR 内部
+    static_root = os.path.abspath(STATIC_DIR)
+    fp = os.path.abspath(os.path.normpath(os.path.join(static_root, path)))
+    try:
+        if os.path.commonpath([static_root, fp]) != static_root:
+            raise HTTPException(status_code=404, detail="not found")
+    except Exception:
         raise HTTPException(status_code=404, detail="not found")
-    with open(fp, "rb") as f: data = f.read()
+    if not os.path.isfile(fp):
+        raise HTTPException(status_code=404, detail="not found")
+    with open(fp, "rb") as f:
+        data = f.read()
     media = "text/plain"
     if path.endswith(".css"): media = "text/css"
     elif path.endswith(".js"): media = "application/javascript"

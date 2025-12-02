@@ -324,8 +324,10 @@ def extract_pairs(jsonl_path: Path,
     norm_pairs = [(_norm_role(a), _norm_role(b)) for a, b in role_pairs]
     want = set(norm_pairs)
 
-    # 读入并建立索引
-    records = list(_read_jsonl(jsonl_path))
+    # 将整个 JSONL 读入一次，供之后的索引并复用
+    records: List[Tuple[int, Dict[str, Any]]] = list(_read_jsonl(jsonl_path))
+
+    # 建立索引以便动态查找
     idx, _ = build_index(records)
 
     deny_res: List[re.Pattern] = []

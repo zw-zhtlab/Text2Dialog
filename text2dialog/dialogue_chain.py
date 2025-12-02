@@ -13,6 +13,7 @@ import time
 import logging
 import threading
 import statistics
+import shutil
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from typing import Dict, List, Any, Optional, Set
@@ -175,6 +176,8 @@ class ThreadSafeDialogueChain:
                 work_item.system_prompt,
                 work_item.chunk,
             )
+            # 途中可能被用户请求取消，避免继续处理
+            self.extractor.control.raise_if_cancelled()
             dialogues = self.extractor._parse_and_validate_response(response)
 
             # 线程安全地转换为标准输出
@@ -581,6 +584,7 @@ IMPORTANT GUIDELINES:
                         if content:
                             # Qwen Thinking 等不会走到这里，但为一致性仍清理一次
                             content = self._strip_reasoning_prefix(content)
+                            self.control.raise_if_cancelled()
                             return content
                     except Exception as e:
                         # 记录后回退到 Chat Completions
@@ -600,6 +604,7 @@ IMPORTANT GUIDELINES:
 
                 # 统一剔除推理前缀（Qwen Thinking 的 <think> 等）
                 content = self._strip_reasoning_prefix(content)
+                self.control.raise_if_cancelled()
                 return content
 
             except CancelledError:
@@ -698,6 +703,14 @@ IMPORTANT GUIDELINES:
     def _parse_and_validate_response(self, response: str) -> List[DialogueItem]:
         """解析并验证 API 响应，返回对话中间结构列表。"""
         text = response or ""
+        # 统一的错误报告（截断长响应以便日志阅读）
+        def _fail(msg: str) -> List[DialogueItem]:
+            snippet = re.sub(r"\s+", " ", text.strip())[:400]
+            logger.error(f"{msg} | 片段: {snippet}")
+            if bool(getattr(Config, "FAIL_ON_PARSE_ERROR", False)):
+                raise ValueError(msg)
+            return []
+
         # 尝试解析
         payload: Optional[str] = None
         try:
@@ -710,20 +723,15 @@ IMPORTANT GUIDELINES:
             payload = self._extract_first_json_array(text)
 
         if payload is None:
-            logger.error("无法从模型响应中提取 JSON 列表")
-            logger.debug(f"原始响应：{text}")
-            return []
+            return _fail("无法从模型响应中提取 JSON 列表")
 
         try:
             data = json.loads(payload)
         except Exception as e:
-            logger.error(f"JSON 反序列化失败：{e}")
-            logger.debug(f"候选 JSON：{payload}")
-            return []
+            return _fail(f"JSON 反序列化失败：{e}")
 
         if not isinstance(data, list):
-            logger.warning("响应不是列表格式，已尝试纠正失败")
-            return []
+            return _fail("响应不是列表格式，已尝试纠正失败")
 
         dialogues: List[DialogueItem] = []
         for item in data:
@@ -801,16 +809,111 @@ IMPORTANT GUIDELINES:
             logger.warning(f"加载进度失败：{e}")
         return None
 
-    # ---------- 已完成块扫描（用于续跑，新增） ----------
+    # ---------- ?????????/??? ----------
+    def _completed_marker_path(self, output_file: str) -> str:
+        """??????? chunk ???????"""
+        return f"{output_file}.complete"
+
+    def _load_completed_chunk_ids(self, output_file: str) -> Set[int]:
+        """????????????? chunk_id ??"""
+        done: Set[int] = set()
+        try:
+            if not output_file:
+                return done
+            meta = self._completed_marker_path(output_file)
+            if not os.path.exists(meta):
+                return done
+            with open(meta, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        done.add(int(s))
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.warning(f"?? chunk ??????:{e}")
+        return done
+
+    def _mark_chunk_completed(self, output_file: str, chunk_id: int) -> None:
+        """????? chunk ???????"""
+        try:
+            if not output_file:
+                return
+            meta = self._completed_marker_path(output_file)
+            # ??????
+            if chunk_id in self._load_completed_chunk_ids(output_file):
+                return
+            Path(meta).resolve().parent.mkdir(parents=True, exist_ok=True)
+            with open(meta, "a", encoding="utf-8") as f:
+                f.write(f"{int(chunk_id)}\n")
+        except Exception as e:
+            logger.warning(f"?? chunk ??????:{e}")
+
+    def _cleanup_output_file(self, output_file: str, completed_ids: Set[int]) -> None:
+        """
+        ???????????? chunk ??????????????????
+        ????????? chunk????? .bak ????
+        """
+        if not output_file or not os.path.exists(output_file):
+            return
+
+        tmp_path = f"{output_file}.tmp"
+        has_incomplete = False
+
+        try:
+            with open(output_file, "r", encoding=getattr(Config, "OUTPUT_ENCODING", "utf-8")) as src, \
+                 open(tmp_path, "w", encoding=getattr(Config, "OUTPUT_ENCODING", "utf-8")) as dst:
+                for line in src:
+                    try:
+                        obj = json.loads(line.strip())
+                    except Exception:
+                        has_incomplete = True
+                        continue
+                    cid = obj.get("chunk_id")
+                    if isinstance(cid, int) and cid in completed_ids:
+                        dst.write(line if line.endswith("\n") else line + "\n")
+                    else:
+                        has_incomplete = True
+
+            if not has_incomplete:
+                os.remove(tmp_path)
+                return
+
+            backup_path = f"{output_file}.bak"
+            try:
+                if not os.path.exists(backup_path):
+                    shutil.copyfile(output_file, backup_path)
+            except Exception:
+                logger.warning(f"????????:{backup_path}")
+
+            os.replace(tmp_path, output_file)
+        except Exception as e:
+            logger.warning(f"????????:{e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
     def _scan_processed_chunk_ids(self, output_file: str) -> Set[int]:
         """
-        扫描已有输出文件，返回其中出现过的 chunk_id 集合；
-        若文件不存在或为空，返回空集。
+        ????? chunk_id ???
+        - ???? .complete ?????
+        - ??????????????? chunk ???????????????????
         """
         processed: Set[int] = set()
         try:
+            completed_from_marker = self._load_completed_chunk_ids(output_file)
+            if completed_from_marker:
+                return completed_from_marker
             if not output_file or not os.path.exists(output_file):
                 return processed
+
+            last_seen: Optional[int] = None
+            ordered_ids: List[int] = []
+
             with open(output_file, "r", encoding=getattr(Config, "OUTPUT_ENCODING", "utf-8")) as f:
                 for line in f:
                     line = line.strip()
@@ -818,18 +921,25 @@ IMPORTANT GUIDELINES:
                         continue
                     try:
                         obj = json.loads(line)
-                        cid = obj.get("chunk_id")
-                        if isinstance(cid, int):
-                            processed.add(cid)
                     except Exception:
-                        # 忽略脏行
                         continue
+                    cid = obj.get("chunk_id")
+                    if not isinstance(cid, int):
+                        continue
+                    if last_seen is None or cid != last_seen:
+                        ordered_ids.append(cid)
+                        last_seen = cid
+
+            if not ordered_ids:
+                return processed
+
+            processed.update(ordered_ids[:-1])
         except Exception as e:
-            logger.warning(f"扫描已完成 chunk 失败：{e}")
+            logger.warning(f"????? chunk ??:{e}")
         return processed
 
     def _first_missing_index(self, done_ids: Set[int]) -> int:
-        """返回从 0 开始首个缺失的 chunk_id（用于确定按序写入起点）。"""
+        """??? 0 ??????? chunk_id??????????????"""
         i = 0
         while i in done_ids:
             i += 1
@@ -872,11 +982,15 @@ IMPORTANT GUIDELINES:
         processed_chunks = self._load_progress(file_path) or 0
         processed_from_file = 0
         existing_ids = self._scan_processed_chunk_ids(output_file)
+        if os.path.exists(output_file):
+            self._cleanup_output_file(output_file, existing_ids)
         if existing_ids:
+            for cid in sorted(existing_ids):
+                self._mark_chunk_completed(output_file, cid)
             processed_from_file = self._first_missing_index(existing_ids)
         if processed_from_file > processed_chunks:
             processed_chunks = processed_from_file
-            logger.info(f"从输出文件恢复进度：已处理 {processed_chunks}/{len(chunks)} 块")
+            logger.info(f"????????????????????? {processed_chunks}/{len(chunks)} ??")
 
         total_dialogues = 0
         was_cancelled = False
@@ -923,6 +1037,7 @@ IMPORTANT GUIDELINES:
                             )
                             f.write("\n")
 
+                    self._mark_chunk_completed(output_file, i)
                     total_dialogues += len(unique_dialogues)
 
                     # 保存进度
@@ -1007,9 +1122,14 @@ IMPORTANT GUIDELINES:
 
         # 续跑支持：扫描已写出的 chunk，过滤重复任务，并定位按序写入起点
         processed_ids: Set[int] = self._scan_processed_chunk_ids(output_file)
+        if os.path.exists(output_file):
+            self._cleanup_output_file(output_file, processed_ids)
+        if processed_ids:
+            for cid in sorted(processed_ids):
+                self._mark_chunk_completed(output_file, cid)
         next_expected = self._first_missing_index(processed_ids)
         if processed_ids:
-            logger.info(f"检测到已有输出：已完成 {len(processed_ids)} 个 chunk，继续处理剩余部分（从 {next_expected} 起）。")
+            logger.info(f"????????????????? {len(processed_ids)} ?? chunk?????????????????? {next_expected} ????")
 
         thread_safe_extractor = ThreadSafeDialogueChain(self)
 
@@ -1021,33 +1141,54 @@ IMPORTANT GUIDELINES:
         total_dialogues = 0
         failed_chunks = 0
         was_cancelled = False
+        failed_details: List[str] = []
 
-        # 有序写入的缓冲区：chunk_id -> List[ChunkDialogueItem]
+        # ?????????chunk_id -> List[ChunkDialogueItem]
         results_buffer: Dict[int, List[ChunkDialogueItem]] = {}
-        completed_chunks: Set[int] = set(processed_ids)  # 已完成集合预置为扫描结果
+        completed_chunks: Set[int] = set(processed_ids)
+        successful_chunks: Set[int] = set()
         self._next_expected_chunk_id = next_expected
 
         def write_ready_results():
-            """按序写入（从 _next_expected_chunk_id 起，连续可用的 chunk）。"""
+            """???? _next_expected_chunk_id ??? chunk ????"""
             while self._next_expected_chunk_id in results_buffer:
+                cid = self._next_expected_chunk_id
                 dialogues = results_buffer.pop(self._next_expected_chunk_id)
                 with open(output_file, "a", encoding=getattr(Config, "OUTPUT_ENCODING", "utf-8")) as f:
                     for d in dialogues:
                         json.dump(d.to_dict(include_chunk_text=self.save_chunk_text), f, ensure_ascii=False)
                         f.write("\n")
                 self._next_expected_chunk_id += 1
+                if cid in successful_chunks:
+                    self._mark_chunk_completed(output_file, cid)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        def mark_chunk_failed(chunk_id: int, err: Optional[BaseException] = None) -> None:
+            """????????????????????"""
+            nonlocal failed_chunks
+            failed_chunks += 1
+            if err:
+                failed_details.append(f"chunk {chunk_id}: {err}")
+            completed_chunks.add(chunk_id)
+            # ??????????????????? _next_expected_chunk_id
+            if chunk_id not in results_buffer:
+                results_buffer[chunk_id] = []
+            write_ready_results()
+
+        cancel_requested = False
+        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        try:
             future_to_item: Dict[Future, WorkItem] = {
                 executor.submit(thread_safe_extractor.process_chunk, item): item
                 for item in work_items
             }
 
-            with tqdm(total=len(work_items), desc="并发提取对话") as pbar:
+            with tqdm(total=len(work_items), desc="????") as pbar:
                 for future in as_completed(future_to_item):
+                    if cancel_requested:
+                        break
                     work_item = future_to_item[future]
                     try:
-                        # 在获取结果前后也检查一次（可快速响应暂停/取消）
+                        # ??????????????/??
                         self.control.wait_if_paused()
                         self.control.raise_if_cancelled()
 
@@ -1056,21 +1197,22 @@ IMPORTANT GUIDELINES:
                         with thread_safe_extractor.lock:
                             results_buffer[work_item.chunk_id] = dialogues
                             completed_chunks.add(work_item.chunk_id)
+                            successful_chunks.add(work_item.chunk_id)
                             total_dialogues += len(dialogues)
 
-                        # 只要就绪就写入（保持有序）
+                        # ?????????????
                         write_ready_results()
 
-                        # 保存并发进度（已完成块数，按总 chunks 计）
+                        # ?????processed_chunks ????/??? chunks ???
                         self._save_progress(
                             file_path,
                             len(completed_chunks),
                             len(chunks),
                             stage="processing",
-                            message="正在处理分块…",
+                            message="??????",
                         )
 
-                        # 更新进度条
+                        # ?????
                         active_qsize = 0
                         try:
                             active_qsize = getattr(executor, "_work_queue").qsize()  # type: ignore[attr-defined]
@@ -1078,44 +1220,53 @@ IMPORTANT GUIDELINES:
                             pass
 
                         pbar.set_postfix({
-                            "累计对话数": total_dialogues,
-                            "失败块数": failed_chunks,
-                            "队列待处理": active_qsize,
+                            "?????": total_dialogues,
+                            "????": failed_chunks,
+                            "????": active_qsize,
                         })
                         pbar.update(1)
 
                     except CancelledError:
-                        # 用户取消：标记并继续等待其他线程尽快收束（软取消）
+                        # ???????? chunk ?????????????
+                        results_buffer.setdefault(work_item.chunk_id, [])
+                        completed_chunks.add(work_item.chunk_id)
+                        write_ready_results()
                         was_cancelled = True
+                        cancel_requested = True
+                        for fut in future_to_item:
+                            if not fut.done():
+                                fut.cancel()
                         self._save_progress(
                             file_path,
                             len(completed_chunks),
                             len(chunks),
                             stage="cancelled",
-                            message="用户取消",
+                            message="????",
                         )
-                        # 不 break：保持 with 块语义，等待已在执行的任务自然返回
                         pbar.set_postfix({
-                            "累计对话数": total_dialogues,
-                            "失败块数": failed_chunks,
-                            "状态": "取消中",
+                            "?????": total_dialogues,
+                            "????": failed_chunks,
+                            "??": "???",
                         })
                         pbar.update(1)
+                        break
                     except Exception as e:
-                        failed_chunks += 1
-                        logger.error(f"处理第 {work_item.index + 1} 块时发生错误：{e}")
+                        logger.error(f"?? {work_item.index + 1} ??????{e}")
+                        mark_chunk_failed(work_item.chunk_id, e)
                         self._save_progress(
                             file_path,
                             len(completed_chunks),
                             len(chunks),
                             stage="processing",
-                            message=f"部分块失败：{failed_chunks}；最近错误：{e}",
+                            message=f"?????{failed_chunks}??????{e}",
                         )
                         pbar.set_postfix({
-                            "累计对话数": total_dialogues,
-                            "失败块数": failed_chunks,
+                            "?????": total_dialogues,
+                            "????": failed_chunks,
                         })
                         pbar.update(1)
+        finally:
+            executor.shutdown(wait=not cancel_requested, cancel_futures=cancel_requested)
 
         # 写入剩余结果（保险起见）
         for _ in range(3):
@@ -1134,6 +1285,26 @@ IMPORTANT GUIDELINES:
         # 收尾（不在此删除 progress.json；由 server 子进程统一清理）
         if was_cancelled:
             logger.info("并发处理被用户取消。")
+            try:
+                self._save_progress(file_path, len(completed_chunks), len(chunks), stage="cancelled", message="用户取消")
+            except Exception:
+                pass
+            return output_file
+
+        # 如有失败或工作线程报错，则宣告失败并抛出异常让上层感知
+        worker_errors = len(thread_safe_extractor.errors)
+        if failed_chunks or worker_errors:
+            summary_parts = []
+            if failed_chunks:
+                summary_parts.append(f"块失败 {failed_chunks} 个")
+            if worker_errors:
+                summary_parts.append(f"线程错误 {worker_errors} 个")
+            summary = "；".join(summary_parts) or "处理异常"
+            try:
+                self._save_progress(file_path, len(chunks), len(chunks), stage="failed", message=summary)
+            except Exception:
+                pass
+            raise RuntimeError(f"并发提取未成功：{summary}")
         else:
             self._save_progress(file_path, len(chunks), len(chunks), stage="done", message="处理完成")
             logger.info(f"并发处理完成！共提取 {total_dialogues} 条对话，失败 {failed_chunks} 块，保存到：{output_file}")
