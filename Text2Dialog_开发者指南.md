@@ -30,15 +30,15 @@ Text2Dialog 是一个将长文本（如小说、剧本）自动抽取为结构�
 - **数据流（Mermaid）**  
 ```mermaid
 flowchart TD
-    UI[静态前端<br/>static/index.html] -->|上传文本| API[/FastAPI server.py/]
-    API -->|POST /api/jobs/create| WorkerProc[子进程 _worker_extract]
+    UI["静态前端<br/>static/index.html"] -->|上传文本| API["FastAPI server.py"]
+    API -->|POST /api/jobs/create| WorkerProc["子进程 _worker_extract"]
     API -->|POST /api/jobs/:id/extract| WorkerProc
-    WorkerProc -->|调用| DC[DialogueChain<br/>分块+LLM 抽取]
-    DC -->|写入| Progress[(jobs/{id}/.cache/progress.json)]
-    DC -->|extraction.jsonl| Artifacts[(jobs/{id}/artifacts)]
-    API -->|POST /api/validate| Validator[validate_output.py]
-    API -->|POST /api/pairs| PairBuilder[pair_dataset_builder.py]
-    API -->|POST /api/chatml| ChatML[pair_to_chatml.py]
+    WorkerProc -->|调用| DC["DialogueChain<br/>分块+LLM 抽取"]
+    DC -->|写入| Progress["jobs/:id/.cache/progress.json"]
+    DC -->|extraction.jsonl| Artifacts["jobs/:id/artifacts"]
+    API -->|POST /api/validate| Validator["validate_output.py"]
+    API -->|POST /api/pairs| PairBuilder["pair_dataset_builder.py"]
+    API -->|POST /api/chatml| ChatML["pair_to_chatml.py"]
     PairBuilder --> ChatML
 ```
 - **作业状态机（Mermaid）**  
