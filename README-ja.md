@@ -1,10 +1,10 @@
 # Text2Dialog：長文テキストを学習可能な対話データに変換する
 
-**文档语言 / Languages / 言語**：
+文档语言 / Languages / 言語：
 [简体中文](./README.md) · [English](./README-en.md) · [日本語](./README-ja.md)
 
 
-> 長文（小説・脚本・ノンフィクション等）から構造化された**登場人物の対話 + 参照関係**を自動抽出し、**品質検査 → 役割ペア化 → ChatML データセット出力**をワンクリックで完了します。コマンドライン、FastAPI サービス、可視化フロントエンド（ワンクリック・ランチャー付き）を提供。
+> 長文（小説・脚本・ノンフィクション等）から構造化された登場人物の対話 + 参照関係を自動抽出し、ワンクリックで「品質検査 → 役割ペア化 → ChatML データセット出力」まで完了します。コマンドライン、FastAPI サービス、可視化フロントエンド（ワンクリック・ランチャー付き）を提供。
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-blue" />
@@ -17,12 +17,12 @@
 
 ## ✨ 機能ハイライト
 
-- **長文の分割**：トークン上限に基づくスマート分割。**チャンク間の重なり文脈**をサポートし、切断による誤判定を抑制。
+- **長文の分割**：トークン上限に基づくスマート分割。チャンク間の重なり文脈をサポートし、切断による誤判定を抑制。
 - **複数プラットフォーム LLM 対応**：OpenAI 互換 SDK で複数プラットフォーム（DeepSeek、SiliconFlow、阿里雲百煉/通義、Kimi/Moonshot、OpenAI、Gemini、AWS Bedrock、カスタム BaseURL）に適合。
 - **高品質抽出**：統一プロンプトと TypeScript 風スキーマで `[{role, dialogue, reply}]` を出力。推論型モデルの「思考」前置きは自動で剥離。
-- **参照関係（reply）**：`reply.target_index` は**同一チャンク内で過去のみ**を参照。回溯ウィンドウと信頼度しきい値は設定可能。
-- **併行実行と続行**：マルチスレッド併行処理、**中断からの続行**、進捗・ETA 推定。**一時停止/再開/取消**に対応。
-- **フルパイプライン**：厳格な**検証器** → **役割ペア化**（A→B / B→A）→ **ChatML 出力**（pair モードと複数ターン stitch モード）。
+- **参照関係（reply）**：`reply.target_index` は同一チャンク内で過去のみを参照。回溯ウィンドウと信頼度しきい値は設定可能。
+- **併行実行と続行**：マルチスレッド併行処理、中断からの続行、進捗・ETA 推定。一時停止/再開/取消に対応。
+- **フルパイプライン**：厳格な検証器 → 役割ペア化（A→B / B→A）→ ChatML 出力（pair モードと複数ターン stitch モード）。
 - **ワンクリック・ランチャー**：`launcher.py` の GUI で仮想環境作成、依存関係インストール、サービス起動/停止、`.env` 設定、フロント/ヘルプを開く。
 
 ---
@@ -48,7 +48,7 @@ Text2Dialog/
 ## 🚀 インストールと実行
 
 ### 1) 動作環境
-- Python **3.9+**（推奨 3.10–3.12）  
+- Python 3.9+（推奨 3.10–3.12）  
 - `pip` が pypi.org にアクセス可能
 
 ### 2) ワンクリック起動（GUI）
@@ -56,9 +56,9 @@ Text2Dialog/
 cd Text2Dialog
 python launcher.py
 ```
-- **「① ワンクリック設定/環境修復」**をクリック：`.venv` を自動作成し、`text2dialog/requirements.txt` をインストール。
-- **「サービス起動」**→**「フロントを開く」**の順にクリックして可視化コンソールへ。
-- **「API 設定を保存（.env）」**でプラットフォームのキーと既定モデルを記入。
+- 「① ワンクリック設定/環境修復」をクリック：`.venv` を自動作成し、`text2dialog/requirements.txt` をインストール。
+- 「サービス起動」→「フロントを開く」の順にクリックして可視化コンソールへ。
+- 「API 設定を保存（.env）」でプラットフォームのキーと既定モデルを記入。
 
 ### 3) 直接起動（CLI）
 ```bash
@@ -68,8 +68,7 @@ bash run_server.sh
 
 # Windows
 cd Text2Dialog
-.
-un_server.bat
+.\run_server.bat
 ```
 手動手順：
 ```bash
@@ -86,14 +85,16 @@ cd Text2Dialog/text2dialog
 python dialogue_chain.py input.txt -o output.jsonl --concurrent -t 8
 
 # よく使うオプション（例）：
-python dialogue_chain.py input.txt -o output.jsonl   --platform siliconflow --concurrent -t 8 --save-chunk-text   --sort-output --stats --reply-window 6 --reply-confidence-th 0.65
+python dialogue_chain.py input.txt -o output.jsonl \
+  --platform siliconflow --concurrent -t 8 --save-chunk-text \
+  --sort-output --stats --reply-window 6 --reply-confidence-th 0.65
 ```
 
 ---
 
 ## 🧪 効果例
 
-以下は **Text2Dialog** で構築したデータを用いて微調整した LLM による**モデル間対話**の一片です：
+以下は Text2Dialog で構築したデータを用いて微調整した LLM によるモデル間対話の一片です：
 
 > **A**：私が目覚めるのを待っていたのか？  
 > **B**：いや。君が永遠に眠るのを待っている。  
@@ -104,7 +105,7 @@ python dialogue_chain.py input.txt -o output.jsonl   --platform siliconflow --co
 > **A**：賞金のためか？  
 > **B**：ひとつの名のためだ。
 
-**この断片から抽出された構造化結果（抜粋、JSONL）：**
+### この断片から抽出された構造化結果（抜粋、JSONL）
 ```json
 {"chunk_id": 0, "dialogue_index": 0, "role": "A", "dialogue": "私が目覚めるのを待っていたのか？", "reply": null}
 {"chunk_id": 0, "dialogue_index": 1, "role": "B", "dialogue": "いや。君が永遠に眠るのを待っている。", "reply": {"target_index": 0, "target_role": "A", "confidence": 0.96}}
@@ -116,7 +117,7 @@ python dialogue_chain.py input.txt -o output.jsonl   --platform siliconflow --co
 {"chunk_id": 0, "dialogue_index": 7, "role": "B", "dialogue": "ひとつの名のためだ。", "reply": {"target_index": 6, "target_role": "A", "confidence": 0.95}}
 ```
 
-**出力された ChatML（pair モード、1 組の例）：**
+### 出力された ChatML（pair モード、1 組の例）
 ```json
 {"messages": [
   {"role": "system", "content": "Bの口調で入力に返答せよ。"},
@@ -154,16 +155,16 @@ LLM_PLATFORM=siliconflow
 OPENAI_API_KEY="sk-..."
 LLM_PLATFORM=openai
 ```
-> フロントエンドの「詳細設定」から**一時的に上書き**（プラットフォーム、API Key、BaseURL、モデル名）も可能で、当該ジョブにのみ適用されます。
+> フロントエンドの「詳細設定」から一時的に上書き（プラットフォーム、API Key、BaseURL、モデル名）も可能で、当該ジョブにのみ適用されます。
 
 ---
 
 ## 🧭 推奨ワークフロー（フロントエンド）
 
-1. **テキストをアップロード**（`.txt`、UTF‑8 推奨）。  
-2. **プラットフォームとモデルを設定**（「詳細設定」で `.env` を上書き可能）。  
-3. **「抽出開始」**をクリックし、進捗バーと ETA を確認。**一時停止/再開/取消**に対応。  
-4. 抽出完了後に順に：**出力検証** → **役割ペア化** → **ChatML 出力**。  
+1. テキストをアップロード（`.txt`、UTF‑8 推奨）。  
+2. プラットフォームとモデルを設定（「詳細設定」で `.env` を上書き可能）。  
+3. 「抽出開始」をクリックし、進捗バーと ETA を確認。一時停止/再開/取消に対応。  
+4. 抽出完了後に順に：出力検証 → 役割ペア化 → ChatML 出力。  
 5. 「ダウンロード」で `extraction.jsonl`、`pair_datasets/`、`chatml.jsonl` を取得。
 
 ---
@@ -184,7 +185,7 @@ LLM_PLATFORM=openai
   }
 }
 ```
-- `reply` は `null` またはオブジェクト。オブジェクトの場合、`target_index` は現在より**前**かつ**同一チャンク**内でなければならない。
+- `reply` は `null` またはオブジェクト。オブジェクトの場合、`target_index` は現在より前かつ同一チャンク内でなければならない。
 
 ### 2) 役割ペアサンプル（pair_dataset_builder.py の出力）
 ```json
@@ -217,7 +218,7 @@ LLM_PLATFORM=openai
 - `--sort-output`：完了後に `chunk_id` 順で整列して書き戻す。
 - `--stats/--no-stats`：全体/チャンク別統計を表示。
 - `-p/--platform`、`--list-platforms`：プラットフォームの選択/一覧。
-- `--reply-window`：reply の遡及ウィンドウ（**同一チャンク**内のより前の発言のみ）。
+- `--reply-window`：reply の遡及ウィンドウ（同一チャンク内のより前の発言のみ）。
 - `--reply-confidence-th`：しきい値未満の `reply` を削除。
 
 ### 2) 役割ペア化（pair_dataset_builder.py）
@@ -226,23 +227,29 @@ LLM_PLATFORM=openai
 python pair_dataset_builder.py -i extraction.jsonl --list-roles
 
 # 有向ペア（複数指定可） → ディレクトリへ出力
-python pair_dataset_builder.py -i extraction.jsonl   --pairs "张三,李四" --pairs "李四,张三"   -o ./pair_datasets --min-confidence 0.80 --strict
+python pair_dataset_builder.py -i extraction.jsonl \
+  --pairs "张三,李四" --pairs "李四,张三" \
+  -o ./pair_datasets --min-confidence 0.80 --strict
 
 # 1 ファイルに結合することも可能
-python pair_dataset_builder.py -i extraction.jsonl --merge-out ./all_pairs.jsonl   --all-ordered-pairs --roles "张三" --roles "李四" --roles "王五"
+python pair_dataset_builder.py -i extraction.jsonl --merge-out ./all_pairs.jsonl \
+  --all-ordered-pairs --roles "张三" --roles "李四" --roles "王五"
 ```
 主なパラメータ要点：
-- `--pairs` / `--roles` + `--all-ordered-pairs`：明示または役割集合の**全順列**で有向ペア生成（自己ペアは除外）。
-- フィルタ：`--min-confidence`（既定 **0.8**）、`--require-confidence`、テキスト長上下限、`--deny-pattern` ブラックリスト正規表現。
-- **厳格モード**（既定有効）：`A→B` が**確実**なサンプルのみ保持。`--no-strict` でヒューリスティックに緩和可。
+- `--pairs` / `--roles` + `--all-ordered-pairs`：明示または役割集合の全順列で有向ペア生成（自己ペアは除外）。
+- フィルタ：`--min-confidence`（既定 0.8）、`--require-confidence`、テキスト長上下限、`--deny-pattern` ブラックリスト正規表現。
+- **厳格モード**（既定有効）：`A→B` が確実なサンプルのみ保持。`--no-strict` でヒューリスティックに緩和可。
 
 ### 3) ChatML 出力（pair_to_chatml.py）
 ```bash
 # 複数ファイル/ディレクトリ/ワイルドカード入力 → 単一 ChatML JSONL
-python pair_to_chatml.py -i ./pair_datasets -o ./chatml.jsonl   --mode pair --dedupe --min-confidence 0.85   --system-template "あなたは {to_role} を演じ、テキストの対話のみに集中してください。"
+python pair_to_chatml.py -i ./pair_datasets -o ./chatml.jsonl \
+  --mode pair --dedupe --min-confidence 0.85 \
+  --system-template "あなたは {to_role} を演じ、テキストの対話のみに集中してください。"
 
 # Stitch モード（同一チャンクの連続サンプルを多輪に連結）
-python pair_to_chatml.py -i ./pair_datasets -o ./chatml_stitch.jsonl   --mode stitch --max-turns 4 --include-meta
+python pair_to_chatml.py -i ./pair_datasets -o ./chatml_stitch.jsonl \
+  --mode stitch --max-turns 4 --include-meta
 ```
 パラメータ要点：
 - `--mode {pair|stitch}`、`--max-turns`、`--min-confidence`、`--dedupe`、`--reverse`、`--include-meta`
@@ -283,13 +290,15 @@ python pair_to_chatml.py -i ./pair_datasets -o ./chatml_stitch.jsonl   --mode st
 
 > さらに `GET /api/defaults` で既定設定を取得可能。静的フロントのルートは `/` および `/static/*`。
 
-**最小限の cURL**
+### 最小限の cURL
 ```bash
 # 1) アップロードしてジョブ作成
 curl -F "file=@input.txt" http://localhost:8000/api/jobs/create
 
 # 2) 抽出をトリガー（job_id とプラットフォーム設定を投入）
-curl -X POST http://localhost:8000/api/jobs/<job_id>/extract   -H "Content-Type: application/json"   -d '{"platform":"siliconflow","api_key":"...","base_url":"https://api.siliconflow.cn/v1","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507","threads":8,"concurrent":true}'
+curl -X POST http://localhost:8000/api/jobs/<job_id>/extract \
+  -H "Content-Type: application/json" \
+  -d '{"platform":"siliconflow","api_key":"...","base_url":"https://api.siliconflow.cn/v1","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507","threads":8,"concurrent":true}'
 
 # 3) 進捗をポーリング
 curl http://localhost:8000/api/jobs/<job_id>/progress
@@ -300,14 +309,14 @@ curl http://localhost:8000/api/jobs/<job_id>/progress
 ## ⚙️ 実装要点
 
 - **分割**：`tiktoken` でトークン数を見積（既定 `cl100k_base`）。`MAX_TOKEN_LEN` と `COVER_CONTENT` は設定可能。
-- **呼び出し**：可能なら OpenAI **Responses API** を優先。不可の場合は **Chat Completions** にフォールバック。
+- **呼び出し**：可能なら OpenAI Responses API を優先。不可の場合は Chat Completions にフォールバック。
 - **頑健性**：自動リトライ、「思考/推論」前置きの統一剥離、二経路出力（reasoning vs content）の解析。
 - **併行書き戻し**：内部バッファ＋`next_expected_chunk_id` により出力順序を安定化。
 - **進捗の永続化**：`.cache/progress.json`。制御ファイル `.cache/control.json` で一時停止/再開/取消をサポート。
 - **検証規則**（抜粋）：
-  - `dialogue_index`：**0 から連続昇順**。重複や飛び番号はエラー。
-  - `role` と `dialogue`：**空不可**。
-  - `reply`：`null` またはオブジェクト。オブジェクトの場合：`target_index` は**現在より前**で**同一チャンク**内、`confidence ∈ [0,1]`。
+  - `dialogue_index`：0 から連続昇順。重複や飛び番号はエラー。
+  - `role` と `dialogue`：空不可。
+  - `reply`：`null` またはオブジェクト。オブジェクトの場合：`target_index` は現在より前で同一チャンク内、`confidence ∈ [0,1]`。
 
 ---
 
@@ -316,8 +325,8 @@ curl http://localhost:8000/api/jobs/<job_id>/progress
 - **出力が空/改行異常**：入力 `.txt` のエンコーディング（UTF‑8 推奨）を確認。前処理で改行をすべて削除していないか確認。
 - **モデルのエラー/レート制限**：併行度 `-t/--threads` を下げ、リトライ間隔を延ばす。`base_url` と `model_name` の整合も確認。
 - **reply の誤対応**：`REPLY_WINDOW` を縮小、または `REPLY_CONFIDENCE_TH` を引き上げる。必要に応じてペア化段階で `--strict` を有効にし、`--min-confidence` を上げる。
-- **チャンク間参照**：現状の `reply` は**同一チャンク内で過去のみ**を対象。チャンクをまたぐ関係は対象外。
+- **チャンク間参照**：現状の `reply` は同一チャンク内で過去のみを対象。チャンクをまたぐ関係は対象外。
 
 ## 📄 ライセンス
 
-本プロジェクトは **MIT License** で公開されています。
+本プロジェクトは MIT License で公開されています。
