@@ -56,7 +56,7 @@ ModelPlatform = None
 validator = None
 pair_builder = None
 p2c = None
-CancelledErrorCls = None  # 新增：用于识别对话链中的取消异常
+CancelledErrorCls = None
 
 def _import_project_modules():
     global DialogueChain, Config, ModelPlatform, validator, pair_builder, p2c, CancelledErrorCls
