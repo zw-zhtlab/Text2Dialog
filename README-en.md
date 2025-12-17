@@ -1,10 +1,10 @@
 # Text2Dialog: Converting Long Texts into Trainable Dialogue Data
 
-**文档语言 / Languages / 言語**：
+文档语言 / Languages / 言語：
 [简体中文](./README.md) · [English](./README-en.md) · [日本語](./README-ja.md)
 
 
-> Automatically extract long-form text (e.g., novels, screenplays, nonfiction) into structured **character dialogues with reply links**, and complete **quality validation → role pairing → ChatML dataset export** in one click. Provides a command line tool, FastAPI service, and a visual frontend (with a one‑click launcher).
+> Automatically extract long-form text (e.g., novels, screenplays, nonfiction) into structured character dialogues with reply links, and complete: quality validation → role pairing → ChatML dataset export in one click. Provides a command line tool, FastAPI service, and a visual frontend (with a one‑click launcher).
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-blue" />
@@ -17,12 +17,12 @@
 
 ## ✨ Highlights
 
-- **Long‑text chunking**: intelligently splits by token limits and supports **overlapping context across chunks** to reduce errors caused by hard cuts in semantics.
+- **Long‑text chunking**: intelligently splits by token limits and supports overlapping context across chunks to reduce errors caused by hard cuts in semantics.
 - **Multi‑platform LLM compatibility**: via an OpenAI‑compatible SDK, supports multiple platforms (DeepSeek, SiliconFlow, Alibaba Bailian/Tongyi, Kimi/Moonshot, OpenAI, Gemini, AWS Bedrock, custom BaseURL).
 - **High‑quality extraction**: unified prompts and a TypeScript‑style schema, outputting `[{role, dialogue, reply}]`; automatically strips “thinking” prefixes from reasoning‑style models.
-- **Reply links (`reply`)**: `reply.target_index` only points **backward within the same chunk**; configurable look‑back window and confidence threshold.
-- **Concurrency & resume**: multithreaded processing, **checkpoint resume**, progress & ETA estimation; supports **pause / resume / cancel**.
-- **End‑to‑end tooling**: strict **validator** → **role‑pair builder** (A→B / B→A) → **ChatML export** (supports pair mode and multi‑turn stitch mode).
+- **Reply links (`reply`)**: `reply.target_index` only points backward within the same chunk; configurable look‑back window and confidence threshold.
+- **Concurrency & resume**: multithreaded processing, checkpoint resume, progress & ETA estimation; supports pause / resume / cancel.
+- **End‑to‑end tooling**: strict validator → role‑pair builder (A→B / B→A) → ChatML export (supports pair mode and multi‑turn stitch mode).
 - **One‑click launcher**: GUI `launcher.py` to create a virtualenv, install dependencies, start/stop the service, write `.env`, and open the frontend & docs.
 
 ---
@@ -48,7 +48,7 @@ Text2Dialog/
 ## 🚀 Installation & Run
 
 ### 1) Requirements
-- Python **3.9+** (recommended 3.10–3.12)  
+- Python 3.9+ (recommended 3.10–3.12)  
 - `pip` can access pypi.org
 
 ### 2) One‑click start (GUI)
@@ -56,9 +56,9 @@ Text2Dialog/
 cd Text2Dialog
 python launcher.py
 ```
-- Click **“① One‑Click Setup / Repair Environment”**: automatically creates `.venv` and installs `text2dialog/requirements.txt`.
-- Click **“Start Service”**, then **“Open Frontend”** to enter the visual console.
-- In **“Save API Config (.env)”**, enter platform keys and the default model.
+- Click “① One‑Click Setup / Repair Environment”: automatically creates `.venv` and installs `text2dialog/requirements.txt`.
+- Click “Start Service”, then “Open Frontend” to enter the visual console.
+- In “Save API Config (.env)”, enter platform keys and the default model.
 
 ### 3) Start the service directly (CLI)
 ```bash
@@ -68,8 +68,7 @@ bash run_server.sh
 
 # Windows
 cd Text2Dialog
-.
-un_server.bat
+.\run_server.bat
 ```
 Manual approach:
 ```bash
@@ -86,14 +85,16 @@ cd Text2Dialog/text2dialog
 python dialogue_chain.py input.txt -o output.jsonl --concurrent -t 8
 
 # Common options (example):
-python dialogue_chain.py input.txt -o output.jsonl   --platform siliconflow --concurrent -t 8 --save-chunk-text   --sort-output --stats --reply-window 6 --reply-confidence-th 0.65
+python dialogue_chain.py input.txt -o output.jsonl \
+  --platform siliconflow --concurrent -t 8 --save-chunk-text \
+  --sort-output --stats --reply-window 6 --reply-confidence-th 0.65
 ```
 
 ---
 
 ## 🧪 Example
 
-Below is a short **inter‑model dialogue** from an LLM fine‑tuned on data built with **Text2Dialog**:
+Below is a short inter‑model dialogue from an LLM fine‑tuned on data built with Text2Dialog:
 
 > **A**: Are you waiting for me to wake up?  
 > **B**: No. I’m waiting for you to sleep forever.  
@@ -104,7 +105,7 @@ Below is a short **inter‑model dialogue** from an LLM fine‑tuned on data bui
 > **A**: For the bounty?  
 > **B**: For a name.
 
-**Structured extraction from the snippet (excerpt, JSONL):**
+### Structured extraction from the snippet (excerpt, JSONL)
 ```json
 {"chunk_id": 0, "dialogue_index": 0, "role": "A", "dialogue": "Are you waiting for me to wake up?", "reply": null}
 {"chunk_id": 0, "dialogue_index": 1, "role": "B", "dialogue": "No. I'm waiting for you to sleep forever.", "reply": {"target_index": 0, "target_role": "A", "confidence": 0.96}}
@@ -116,7 +117,7 @@ Below is a short **inter‑model dialogue** from an LLM fine‑tuned on data bui
 {"chunk_id": 0, "dialogue_index": 7, "role": "B", "dialogue": "For a name.", "reply": {"target_index": 6, "target_role": "A", "confidence": 0.95}}
 ```
 
-**Exported ChatML (pair mode, one example pair):**
+### Exported ChatML (pair mode, one example pair)
 ```json
 {"messages": [
   {"role": "system", "content": "Reply to the input in B’s voice."},
@@ -154,17 +155,17 @@ LLM_PLATFORM=siliconflow
 OPENAI_API_KEY="sk-..."
 LLM_PLATFORM=openai
 ```
-> The frontend’s **Advanced Settings** also support **temporary overrides** (platform, API key, BaseURL, model name) that apply to the current job only.
+> The frontend’s “Advanced Settings” also support temporary overrides (platform, API key, BaseURL, model name) that apply to the current job only.
 
 ---
 
 ## 🧭 Recommended Workflow (Frontend)
 
-1. **Upload text** (`.txt`, UTF‑8 recommended).  
-2. **Set platform & model** (you can override `.env` in **Advanced Settings**).  
-3. Click **Start Extraction**, monitor the progress bar & ETA; supports **pause / resume / cancel**.  
-4. After extraction, run **Validate Output** → **Role Pairing** → **Export ChatML**.  
-5. In **Downloads**, fetch `extraction.jsonl`, `pair_datasets/`, `chatml.jsonl`.
+1. Upload text (`.txt`, UTF‑8 recommended).  
+2. Set platform & model (you can override `.env` in “Advanced Settings”).  
+3. Click “Start Extraction”, monitor the progress bar & ETA; supports pause / resume / cancel.  
+4. After extraction, run: Validate Output → Role Pairing → Export ChatML.  
+5. In “Downloads”, fetch `extraction.jsonl`, `pair_datasets/`, `chatml.jsonl`.
 
 ---
 
@@ -184,7 +185,7 @@ LLM_PLATFORM=openai
   }
 }
 ```
-- `reply` may be `null` or an object. If an object, `target_index` **must be earlier than** the current `dialogue_index` and be in the **same chunk**.
+- `reply` may be `null` or an object. If an object, `target_index` must be earlier than the current `dialogue_index` and be in the same chunk.
 
 ### 2) Role‑pair samples (produced by `pair_dataset_builder.py`)
 ```json
@@ -217,7 +218,7 @@ Common arguments:
 - `--sort-output`: sort by `chunk_id` before writing back.
 - `--stats/--no-stats`: print overall/per‑chunk statistics.
 - `-p/--platform`, `--list-platforms`: select or list platforms.
-- `--reply-window`: reply look‑back window (only earlier turns **within this chunk**).
+- `--reply-window`: reply look‑back window (only earlier turns within this chunk).
 - `--reply-confidence-th`: remove `reply` if below the threshold.
 
 ### 2) Role pairing (`pair_dataset_builder.py`)
@@ -226,23 +227,29 @@ Common arguments:
 python pair_dataset_builder.py -i extraction.jsonl --list-roles
 
 # Specify ordered pairs (repeatable) → output to directory
-python pair_dataset_builder.py -i extraction.jsonl   --pairs "Zhang San,Li Si" --pairs "Li Si,Zhang San"   -o ./pair_datasets --min-confidence 0.80 --strict
+python pair_dataset_builder.py -i extraction.jsonl \
+  --pairs "Zhang San,Li Si" --pairs "Li Si,Zhang San" \
+  -o ./pair_datasets --min-confidence 0.80 --strict
 
 # Alternatively, merge into one file
-python pair_dataset_builder.py -i extraction.jsonl --merge-out ./all_pairs.jsonl   --all-ordered-pairs --roles "Zhang San" --roles "Li Si" --roles "Wang Wu"
+python pair_dataset_builder.py -i extraction.jsonl --merge-out ./all_pairs.jsonl \
+  --all-ordered-pairs --roles "Zhang San" --roles "Li Si" --roles "Wang Wu"
 ```
 Key arguments:
-- `--pairs` / `--roles` + `--all-ordered-pairs`: explicitly specify or **permute** the role set to generate ordered pairs (excluding reflexive pairs).
-- Filtering: `--min-confidence` (default **0.8**), `--require-confidence`, text length bounds, and `--deny-pattern` blacklist regex.
-- **Strict mode** (enabled by default): keep only samples **unambiguously** determined as `A→B`; use `--no-strict` to relax to heuristics.
+- `--pairs` / `--roles` + `--all-ordered-pairs`: explicitly specify or permute the role set to generate ordered pairs (excluding reflexive pairs).
+- Filtering: `--min-confidence` (default 0.8), `--require-confidence`, text length bounds, and `--deny-pattern` blacklist regex.
+- **Strict mode** (enabled by default): keep only samples unambiguously determined as `A→B`; use `--no-strict` to relax to heuristics.
 
 ### 3) ChatML export (`pair_to_chatml.py`)
 ```bash
 # Multiple files/dirs/globs → single ChatML JSONL
-python pair_to_chatml.py -i ./pair_datasets -o ./chatml.jsonl   --mode pair --dedupe --min-confidence 0.85   --system-template "You are now {to_role}. Reply strictly about the text dialogue."
+python pair_to_chatml.py -i ./pair_datasets -o ./chatml.jsonl \
+  --mode pair --dedupe --min-confidence 0.85 \
+  --system-template "You are now {to_role}. Reply strictly about the text dialogue."
 
 # Stitch mode (stitch consecutive samples within the same chunk into multi-turn)
-python pair_to_chatml.py -i ./pair_datasets -o ./chatml_stitch.jsonl   --mode stitch --max-turns 4 --include-meta
+python pair_to_chatml.py -i ./pair_datasets -o ./chatml_stitch.jsonl \
+  --mode stitch --max-turns 4 --include-meta
 ```
 Notes:
 - `--mode {pair|stitch}`, `--max-turns`, `--min-confidence`, `--dedupe`, `--reverse`, `--include-meta`.
@@ -283,13 +290,15 @@ Notes:
 
 > There is also `GET /api/defaults` to fetch default configuration; static frontend routes are served at `/` and `/static/*`.
 
-**Minimal end‑to‑end cURL:**
+### Minimal end‑to‑end cURL
 ```bash
 # 1) Upload and create a job
 curl -F "file=@input.txt" http://localhost:8000/api/jobs/create
 
 # 2) Trigger extraction (fill in job_id and your platform params)
-curl -X POST http://localhost:8000/api/jobs/<job_id>/extract   -H "Content-Type: application/json"   -d '{"platform":"siliconflow","api_key":"...","base_url":"https://api.siliconflow.cn/v1","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507","threads":8,"concurrent":true}'
+curl -X POST http://localhost:8000/api/jobs/<job_id>/extract \
+  -H "Content-Type: application/json" \
+  -d '{"platform":"siliconflow","api_key":"...","base_url":"https://api.siliconflow.cn/v1","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507","threads":8,"concurrent":true}'
 
 # 3) Poll progress
 curl http://localhost:8000/api/jobs/<job_id>/progress
@@ -300,14 +309,14 @@ curl http://localhost:8000/api/jobs/<job_id>/progress
 ## ⚙️ Implementation Notes
 
 - **Chunking**: token estimation via `tiktoken` (default `cl100k_base`); `MAX_TOKEN_LEN` and `COVER_CONTENT` are configurable.
-- **Call stack**: prefer OpenAI **Responses API** (when available), otherwise fall back to **Chat Completions**.
+- **Call stack**: prefer OpenAI Responses API (when available), otherwise fall back to Chat Completions.
 - **Robustness**: automatic retries, unified stripping of “thinking/reasoning” prefixes, and parsing of dual‑channel outputs (reasoning vs. content).
 - **Concurrent writeback**: internal buffer + `next_expected_chunk_id` ensure stable output ordering.
 - **Progress persistence**: `.cache/progress.json`; control file `.cache/control.json` supports pause/resume/cancel.
 - **Validation rules** (partial):
-  - `dialogue_index`: **starts at 0 and increments contiguously**; duplicates or gaps are errors.
-  - `role` and `dialogue`: **non‑empty**.
-  - `reply`: `null` or object. If object: `target_index` **earlier than current** and in the same chunk; `confidence ∈ [0,1]`.
+  - `dialogue_index`: starts at 0 and increments contiguously; duplicates or gaps are errors.
+  - `role` and `dialogue`: non‑empty.
+  - `reply`: `null` or object. If object: `target_index` earlier than current and in the same chunk; `confidence ∈ [0,1]`.
 
 ---
 
@@ -316,8 +325,8 @@ curl http://localhost:8000/api/jobs/<job_id>/progress
 - **Empty output or broken line breaks**: ensure the input `.txt` encoding (UTF‑8 recommended) and check that preprocessing didn’t remove all newlines.
 - **Frequent model errors / rate limiting**: lower concurrency (`-t/--threads`), increase retry intervals; ensure `base_url` and `model_name` match the platform.
 - **Reply mismatches**: decrease `REPLY_WINDOW`, or raise `REPLY_CONFIDENCE_TH`; during pairing, enable `--strict` and increase `--min-confidence` if needed.
-- **Cross‑chunk references**: currently `reply` only links backward **within the same chunk**; cross‑chunk relations are out of scope.
+- **Cross‑chunk references**: currently `reply` only links backward within the same chunk; cross‑chunk relations are out of scope.
 
 ## 📄 License
 
-Released under the **MIT License**.
+Released under the MIT License.
