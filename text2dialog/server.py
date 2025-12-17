@@ -300,7 +300,7 @@ def _worker_extract(job_id: str, req_body: Dict[str, Any]) -> None:
         out_file = os.path.join(_job_dir(job_id), "extraction.jsonl")
         existing_artifacts = dict(_load_job(job_id).get("artifacts", {}))
         existing_artifacts["extraction"] = out_file
-        _update_job(job_id, status="running", message="???????", cache_dir=cache_dir, artifacts=existing_artifacts)
+        _update_job(job_id, status="running", message="正在提取对话…", cache_dir=cache_dir, artifacts=existing_artifacts)
 
         extractor = DialogueChain(
             schema=None,
