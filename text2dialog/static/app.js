@@ -343,11 +343,28 @@
       const resp = await fetch(`/api/jobs/${jobId}/download?which=extraction`);
       const txt = await resp.text();
       const lines = txt.trim().split('\n').slice(0, 8);
-      const html = lines.map((l, i) => {
-        try { return `<pre>${i + 1}. ${JSON.stringify(JSON.parse(l), null, 2)}</pre>`; }
-        catch { return `<pre>${i + 1}. ${l}</pre>`; }
-      }).join('');
-      $('#preview').innerHTML = `<div class="hint">前 8 条：</div>${html}`;
+      const previewEl = $('#preview');
+      if (!previewEl) return;
+      previewEl.textContent = '';
+
+      const frag = document.createDocumentFragment();
+      const hint = document.createElement('div');
+      hint.className = 'hint';
+      hint.textContent = '前 8 条：';
+      frag.appendChild(hint);
+
+      lines.forEach((line, i) => {
+        const pre = document.createElement('pre');
+        let content = line;
+        try {
+          content = JSON.stringify(JSON.parse(line), null, 2);
+        } catch {
+          // Keep raw line when JSON parsing fails.
+        }
+        pre.textContent = `${i + 1}. ${content}`;
+        frag.appendChild(pre);
+      });
+      previewEl.appendChild(frag);
     } catch (e) {
       console.warn('预览失败：', e);
     }
