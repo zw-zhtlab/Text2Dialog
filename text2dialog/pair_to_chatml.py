@@ -313,13 +313,13 @@ def stitch_sequences_bidirectional(records: List[PairRecord], max_turns: int) ->
       规则：后一条的 source 必须与前一条的 reply 完全一致（chunk/index/role）。
     采用贪心策略：从最早的样本开始，尽量延长，避免交叉复用（消费掉已用边）。
     """
-    # 按 source 起点建立索引： (role, index) -> [PairRecord...]
-    by_source: DefaultDict[Tuple[str, int], List[PairRecord]] = defaultdict(list)
-    for r in records:
-        by_source[(r.source.role, r.source.dialogue_index)].append(r)
+    # 按 source 起点建立索引： (role, index) -> [record_index...]
+    by_source: DefaultDict[Tuple[str, int], List[int]] = defaultdict(list)
+    for i, r in enumerate(records):
+        by_source[(r.source.role, r.source.dialogue_index)].append(i)
     # 每个列表按 reply.index 升序，尽量选择最近的下一轮
     for k in by_source:
-        by_source[k].sort(key=lambda r: r.reply.dialogue_index)
+        by_source[k].sort(key=lambda i: records[i].reply.dialogue_index)
 
     used: set = set()
     # used 存放的是 records 中的下标索引
@@ -343,20 +343,16 @@ def stitch_sequences_bidirectional(records: List[PairRecord], max_turns: int) ->
             expect_idx = last.reply.dialogue_index
             cands = by_source.get((expect_role, expect_idx), [])
             # 选择首个尚未使用的候选
-            next_rec = None
-            for cand in cands:
-                try:
-                    ci = records.index(cand)  # 小数据量可接受；若需提速可改为字典映射
-                except ValueError:
-                    continue
+            next_idx = None
+            for ci in cands:
                 if ci in used:
                     continue
-                next_rec = cand
+                next_idx = ci
                 used.add(ci)
                 break
-            if next_rec is None:
+            if next_idx is None:
                 break
-            cur.append(next_rec)
+            cur.append(records[next_idx])
         sessions.append(cur)
     return sessions
 

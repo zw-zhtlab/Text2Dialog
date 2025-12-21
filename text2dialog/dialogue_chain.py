@@ -205,7 +205,7 @@ class ThreadSafeDialogueChain:
             with self.lock:
                 self.errors.append(f"处理第 {work_item.index + 1} 块时发生错误：{e}")
             logger.error(f"处理第 {work_item.index + 1} 块时发生错误：{e}")
-            return []
+            raise
 
 
 # ========== 主类 ==========
@@ -1164,9 +1164,17 @@ IMPORTANT GUIDELINES:
         successful_chunks: Set[int] = set()
         self._next_expected_chunk_id = next_expected
 
+        def _advance_expected():
+            while (self._next_expected_chunk_id in completed_chunks
+                   and self._next_expected_chunk_id not in results_buffer):
+                self._next_expected_chunk_id += 1
+
         def write_ready_results():
             """按 _next_expected_chunk_id 将可写 chunk 依序写入输出文件。"""
-            while self._next_expected_chunk_id in results_buffer:
+            while True:
+                _advance_expected()
+                if self._next_expected_chunk_id not in results_buffer:
+                    break
                 cid = self._next_expected_chunk_id
                 dialogues = results_buffer.pop(self._next_expected_chunk_id)
                 with open(output_file, "a", encoding=getattr(Config, "OUTPUT_ENCODING", "utf-8")) as f:

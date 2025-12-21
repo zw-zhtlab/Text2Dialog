@@ -19,7 +19,7 @@ pair_dataset_builder.py
    - 要求存在 `confidence`，且 >= `--min-confidence`（默认 0.8，可调）。
 3) **鲁棒跳过不合法数据**：
    - 无法解析的 JSON 行、非 dict、关键字段缺失/类型错误 → **跳过并告警**，不中止。
-   - 源/回复文本若为空、包含非法控制字符（除 `\\t\\n\\r`）、或包含 Unicode 替换字符 `�` → **跳过**。
+   - 源/回复文本若为空、包含非法控制字符（除 `\\t\\n\\r`）、或包含 Unicode 替换字符 `\\uFFFD` → **跳过**。
    - 可用 `--deny-pattern` 指定正则黑名单；命中则跳过（对源与回复文本都生效）。
    - 可用 `--min-src-chars/--min-reply-chars/--max-src-chars/--max-reply-chars` 设置字符长度阈值。
 4) **多对输出**：`--pairs "A,B" "B,C" "B,D"` 会分别生成三个文件；方向不同各自独立。
@@ -141,7 +141,7 @@ def _is_text_legal(text: str,
         return False
     if max_chars is not None and len(t) > int(max_chars):
         return False
-    if '�' in t:
+    if "\uFFFD" in t:
         return False
     if _has_illegal_control_chars(t):
         return False
@@ -369,12 +369,16 @@ def extract_pairs(jsonl_path: Path,
                 continue
 
         # 方向匹配
-        pair = (src_role, tgt_role)
+        pair_src_role = src_role
+        pair_tgt_role = tgt_role
+        pair = (pair_src_role, pair_tgt_role)
         matched = pair in want
 
         if not matched and use_target_role_fallback and target_role_field is not None:
-            alt_pair = (_norm_role(target_role_field), tgt_role)
+            alt_src_role = _norm_role(target_role_field)
+            alt_pair = (alt_src_role, tgt_role)
             if alt_pair in want:
+                pair_src_role = alt_src_role
                 pair = alt_pair
                 matched = True
 
@@ -399,16 +403,16 @@ def extract_pairs(jsonl_path: Path,
         sample = PairSample(
             src_chunk_id=src.key.chunk_id,
             src_index=src.key.index,
-            src_role=src_role,
+            src_role=pair_src_role,
             src_text=src.text,
             tgt_chunk_id=cur.key.chunk_id,
             tgt_index=cur.key.index,
-            tgt_role=tgt_role,
+            tgt_role=pair_tgt_role,
             tgt_text=cur.text,
-            pair=(src_role, tgt_role),
+            pair=pair,
             confidence=(float(conf) if conf is not None else None),
         )
-        buckets[(src_role, tgt_role)].append(sample)
+        buckets[pair].append(sample)
 
     return buckets
 
