@@ -122,14 +122,40 @@ class Config:
     REPLY_CONFIDENCE_TH = 0.65       # 低于此阈值则视为不确定 -> reply=null
 
     @classmethod
+    def _api_key_env_candidates(
+        cls, platform: str, platform_config: Dict[str, Any]
+    ) -> List[str]:
+        """返回平台 API Key 环境变量候选（主变量 + 兼容别名）。"""
+        candidates = [str(platform_config["api_key_env"])]
+        # DeepSeek 兼容旧变量名，避免 launcher 历史配置失效。
+        if platform == "deepseek":
+            candidates.append("DEEPSEEK_API_KEY")
+        # 去重并保持顺序
+        seen = set()
+        out: List[str] = []
+        for name in candidates:
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
+
+    @classmethod
+    def _resolve_api_key(cls, platform: str, platform_config: Dict[str, Any]) -> str:
+        for env_name in cls._api_key_env_candidates(platform, platform_config):
+            value = os.getenv(env_name)
+            if value:
+                return value
+        return ""
+
+    @classmethod
     def get_current_platform_config(cls) -> Dict[str, Any]:
         """获取当前平台的配置"""
         platform_config = ModelPlatform.get_platform_config(cls.CURRENT_PLATFORM)
 
-        api_key_env = platform_config["api_key_env"]
+        api_key_envs = cls._api_key_env_candidates(cls.CURRENT_PLATFORM, platform_config)
         base_url_env = platform_config["base_url_env"]
 
-        api_key = os.getenv(api_key_env)
+        api_key = cls._resolve_api_key(cls.CURRENT_PLATFORM, platform_config)
         base_url = os.getenv(base_url_env, platform_config["default_base_url"])
         model_name = os.getenv(
             f"{cls.CURRENT_PLATFORM.upper()}_MODEL_NAME",
@@ -141,20 +167,20 @@ class Config:
             available_platforms = [
                 name
                 for name, cfg in ModelPlatform.PLATFORMS.items()
-                if os.getenv(cfg["api_key_env"])
+                if cls._resolve_api_key(name, cfg)
             ]
 
             if available_platforms:
                 raise ValueError(
                     f"平台 {cls.CURRENT_PLATFORM} 的API密钥未设置。\n"
-                    f"请设置环境变量 {api_key_env}，\n"
+                    f"请设置环境变量 {' 或 '.join(api_key_envs)}，\n"
                     f"或使用其他已配置的平台: {', '.join(available_platforms)}\n"
                     f"可通过设置 LLM_PLATFORM 环境变量切换平台"
                 )
             else:
                 env_list = [
-                    f'  - {cfg["api_key_env"]}'
-                    for cfg in ModelPlatform.PLATFORMS.values()
+                    f"  - {' 或 '.join(cls._api_key_env_candidates(name, cfg))}"
+                    for name, cfg in ModelPlatform.PLATFORMS.items()
                 ]
                 raise ValueError(
                     f"未找到任何已配置的API密钥。\n"

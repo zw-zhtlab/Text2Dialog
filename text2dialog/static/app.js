@@ -274,18 +274,22 @@
       setControlButtonsByStatus(status || stage || '');
 
       // 状态特殊处理：暂停/取消中/已取消
-      if (status === 'paused') {
+      const isPaused = (status === 'paused');
+      const isCancelling = (status === 'cancelling');
+      const isCancelled = (status === 'cancelled' || stage === 'cancelled');
+
+      if (isPaused) {
         setProgressIndeterminate(stageText || '已暂停');
         // 继续轮询，等待恢复/取消
         pollTimer = setTimeout(poll, 1200);
         return;
       }
-      if (status === 'cancelling') {
+      if (isCancelling) {
         setProgressIndeterminate(stageText || '正在取消…');
         pollTimer = setTimeout(poll, 1200);
         return;
       }
-      if (status === 'cancelled') {
+      if (isCancelled) {
         $('#status').textContent = stageText || '已取消';
         enableRun(true);
         enableAfterExtract(false);
@@ -303,8 +307,21 @@
         setProgressDeterminate(processed, total, stageText, message, isFinite(pct) ? pct : 0, eta);
       }
 
-      // 收敛条件
-      if (status === 'succeeded' || stage === 'done' || (Number.isFinite(total) && total > 0 && processed >= total)) {
+      // 收敛条件：失败优先于成功，避免 failed + processed>=total 被误判为成功
+      const reachedTotal = Number.isFinite(total) && total > 0 && processed >= total;
+      const isFailed = (status === 'failed' || stage === 'failed');
+      const isSucceeded = (status === 'succeeded' || stage === 'done' || reachedTotal) && !isFailed && !isCancelled;
+
+      if (isFailed) {
+        $('#status').textContent = '失败：' + (message || '');
+        enableAfterExtract(false);
+        enableRun(true);
+        setControlButtonsByStatus('failed');
+        clearPollTimer();
+        return;
+      }
+
+      if (isSucceeded) {
         // 成功收尾
         $('#status').textContent = '完成';
         enableAfterExtract(true);
@@ -315,15 +332,6 @@
         $('#downloadExtract').href = url;
         await preview();
         await loadStats();
-        clearPollTimer();
-        return;
-      }
-
-      if (status === 'failed' || stage === 'failed') {
-        $('#status').textContent = '失败：' + (message || '');
-        enableAfterExtract(false);
-        enableRun(true);
-        setControlButtonsByStatus('failed');
         clearPollTimer();
         return;
       }

@@ -10,6 +10,7 @@ import os
 import re
 import json
 import time
+import sys
 import logging
 import threading
 import statistics
@@ -214,6 +215,17 @@ class DialogueChain:
 
     # 并发写有序结果时使用
     _next_expected_chunk_id: int
+
+    @staticmethod
+    def _tqdm_enabled() -> bool:
+        """
+        仅在交互式终端启用 tqdm。
+        在服务端/后台进程中关闭，避免输出流阻塞导致主循环卡住。
+        """
+        try:
+            return bool(sys.stderr and sys.stderr.isatty())
+        except Exception:
+            return False
 
     def _effective_reply_window(self) -> int:
         """
@@ -1010,7 +1022,12 @@ IMPORTANT GUIDELINES:
         total_dialogues = 0
         was_cancelled = False
 
-        with tqdm(total=len(chunks), desc="提取对话", initial=processed_chunks) as pbar:
+        with tqdm(
+            total=len(chunks),
+            desc="提取对话",
+            initial=processed_chunks,
+            disable=not self._tqdm_enabled(),
+        ) as pbar:
             for i, chunk in enumerate(chunks):
                 if i < processed_chunks:
                     continue
@@ -1205,7 +1222,11 @@ IMPORTANT GUIDELINES:
                 for item in work_items
             }
 
-            with tqdm(total=len(work_items), desc="并发提取") as pbar:
+            with tqdm(
+                total=len(work_items),
+                desc="并发提取",
+                disable=not self._tqdm_enabled(),
+            ) as pbar:
                 for future in as_completed(future_to_item):
                     if cancel_requested:
                         break

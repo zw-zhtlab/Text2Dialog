@@ -17,6 +17,7 @@ import uuid
 import signal
 import hmac
 import ipaddress
+from contextlib import contextmanager
 from typing import Optional, Dict, Any, List
 try:
     # Python 3.8+
@@ -206,6 +207,73 @@ def _load_job(job_id: str) -> Dict[str, Any]:
         return job
     raise KeyError(job_id)
 
+def _load_job_or_404(job_id: str) -> Dict[str, Any]:
+    try:
+        return _load_job(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="job not found")
+
+def _is_process_alive(pid: Any) -> bool:
+    try:
+        p = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if p <= 0:
+        return False
+    try:
+        os.kill(p, 0)
+        return True
+    except PermissionError:
+        # 无权限通常表示进程存在
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+def _job_start_lock_path(job_id: str) -> str:
+    cache_dir = os.path.join(_job_dir(job_id), ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "start.lock")
+
+@contextmanager
+def _job_start_lock(job_id: str):
+    lock_path = _job_start_lock_path(job_id)
+    fd: Optional[int] = None
+    for attempt in range(2):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            # 仅清理很短暂之外的陈旧锁，避免极端崩溃后永久阻塞启动。
+            if attempt == 0:
+                try:
+                    age = time.time() - os.path.getmtime(lock_path)
+                    if age > 30:
+                        os.remove(lock_path)
+                        continue
+                except FileNotFoundError:
+                    continue
+                except Exception:
+                    pass
+            raise HTTPException(status_code=409, detail="job start is already in progress")
+    if fd is None:
+        raise HTTPException(status_code=409, detail="job start is already in progress")
+    try:
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        yield
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
 def _update_job(job_id: str, **patch: Any) -> None:
     job = _load_job(job_id); job.update(patch); _save_job(job_id)
 
@@ -361,14 +429,14 @@ def get_job(job_id: str):
 @app.get("/api/jobs/{job_id}/progress")
 def poll_progress(job_id: str):
     _import_project_modules()
-    job = _load_job(job_id)
+    job = _load_job_or_404(job_id)
     prog = _read_progress(job.get("cache_dir"))
     return {"progress": prog, "status": job.get("status"), "message": job.get("message")}
 
 @app.get("/api/jobs/{job_id}/download")
 def download(job_id: str, which: str):
     _import_project_modules()
-    job = _load_job(job_id)
+    job = _load_job_or_404(job_id)
     art = job.get("artifacts", {})
     path = art.get(which)
     if not path:
@@ -458,24 +526,30 @@ def _worker_extract(job_id: str, req_body: Dict[str, Any]) -> None:
 @app.post("/api/jobs/{job_id}/extract")
 async def run_extract(job_id: str, request: Request):
     _import_project_modules()
-    # 立即读取并验证
-    _ = _load_job(job_id)
     body = await request.json()
     req = ExtractReq(**body)
-    cache_dir = os.path.join(_job_dir(job_id), ".cache"); os.makedirs(cache_dir, exist_ok=True)
+    with _job_start_lock(job_id):
+        # 立即读取并验证
+        job = _load_job_or_404(job_id)
+        status = str(job.get("status") or "").lower()
+        if status in {"running", "paused", "cancelling"} and _is_process_alive(job.get("pid")):
+            raise HTTPException(status_code=409, detail="job is already running")
 
-    # 启动前将控制状态置为 running
-    try:
-        _write_control(job_id, "running", "准备启动")
-    except Exception:
-        pass
+        cache_dir = os.path.join(_job_dir(job_id), ".cache")
+        os.makedirs(cache_dir, exist_ok=True)
 
-    # 启动子进程（互不影响）
-    p = Process(target=_worker_extract, args=(job_id, req.dict()))
-    p.daemon = True
-    p.start()
-    _update_job(job_id, message="已启动作业", pid=p.pid, cache_dir=cache_dir, status="running")
-    return {"ok": True, "pid": p.pid}
+        # 启动前将控制状态置为 running
+        try:
+            _write_control(job_id, "running", "准备启动")
+        except Exception:
+            pass
+
+        # 启动子进程（互不影响）
+        p = Process(target=_worker_extract, args=(job_id, req.dict()))
+        p.daemon = True
+        p.start()
+        _update_job(job_id, message="已启动作业", pid=p.pid, cache_dir=cache_dir, status="running")
+        return {"ok": True, "pid": p.pid}
 
 class ControlReq(BaseModel):
     action: Literal["pause", "resume", "cancel", "force-cancel"]
@@ -533,7 +607,7 @@ class ValidateReq(BaseModel):
 def run_validate(req: ValidateReq):
     _import_project_modules()
     job_id = _require_job_id(req.job_id)
-    job = _load_job(job_id)
+    job = _load_job_or_404(job_id)
     src_raw = req.input_path or job.get("artifacts", {}).get("extraction")
     if not src_raw:
         raise HTTPException(status_code=400, detail="no input file available for validate")
@@ -583,7 +657,7 @@ class PairBuildReq(BaseModel):
 def build_pairs(req: PairBuildReq):
     _import_project_modules()
     job_id = _require_job_id(req.job_id)
-    job = _load_job(job_id)
+    job = _load_job_or_404(job_id)
     src_raw = req.input_path or job.get("artifacts", {}).get("validated") or job.get("artifacts", {}).get("extraction")
     if not src_raw:
         raise HTTPException(status_code=400, detail="no usable JSONL input")
@@ -703,7 +777,7 @@ class ChatMLReq(BaseModel):
 def build_chatml(req: ChatMLReq):
     _import_project_modules()
     job_id = _require_job_id(req.job_id)
-    job = _load_job(job_id)
+    job = _load_job_or_404(job_id)
     inputs_raw = req.input or os.path.join(_job_dir(job_id), "pair_datasets")
     out_raw = req.out or os.path.join(_job_dir(job_id), "chatml.jsonl")
     inputs = _resolve_job_scoped_path(job_id, inputs_raw, "input")
