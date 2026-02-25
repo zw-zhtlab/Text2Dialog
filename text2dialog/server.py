@@ -4,7 +4,7 @@
 server.py — FastAPI 服务，为 text2dialog 提供可视化前端 API。
 运行：
   pip install -r requirements.txt -i https://pypi.org/simple
-  uvicorn server:app --host 0.0.0.0 --port 8000
+  uvicorn server:app --host 127.0.0.1 --port 8000
 
 """
 import os
@@ -15,6 +15,8 @@ import json
 import time
 import uuid
 import signal
+import hmac
+import ipaddress
 from typing import Optional, Dict, Any, List
 try:
     # Python 3.8+
@@ -35,6 +37,20 @@ APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(APP_ROOT, "static")
 JOBS_DIR = os.path.join(APP_ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
+
+_TRUE_SET = {"1", "true", "yes", "on"}
+_JOB_ID_RE = re.compile(r"^[0-9a-fA-F]{12}$")
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUE_SET
+
+ALLOW_REMOTE = _env_flag("TEXT2DIALOG_ALLOW_REMOTE", default=False)
+ALLOW_EXTERNAL_PATHS = _env_flag("TEXT2DIALOG_ALLOW_EXTERNAL_PATHS", default=False)
+TRUST_PROXY_HEADERS = _env_flag("TEXT2DIALOG_TRUST_PROXY_HEADERS", default=False)
+REMOTE_API_TOKEN = (os.getenv("TEXT2DIALOG_API_TOKEN") or "").strip()
 
 # ---- 将“可能的项目目录”加入 sys.path，确保能导入 ----
 POSSIBLE_DIRS = [
@@ -102,8 +118,76 @@ _JOBS: Dict[str, Dict[str, Any]] = {}
 def _now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
+def _require_job_id(job_id: str) -> str:
+    jid = (job_id or "").strip()
+    if not _JOB_ID_RE.fullmatch(jid):
+        raise HTTPException(status_code=400, detail="invalid job_id")
+    return jid.lower()
+
+def _is_within(base_dir: str, target_path: str) -> bool:
+    try:
+        return os.path.commonpath([base_dir, target_path]) == base_dir
+    except Exception:
+        return False
+
+def _resolve_job_scoped_path(job_id: str, raw_path: str, field_name: str) -> str:
+    text = (raw_path or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail=f"{field_name} is empty")
+    job_root = os.path.abspath(_job_dir(job_id))
+    if os.path.isabs(text):
+        resolved = os.path.abspath(os.path.expanduser(text))
+    else:
+        resolved = os.path.abspath(os.path.join(job_root, text))
+    if not ALLOW_EXTERNAL_PATHS and not _is_within(job_root, resolved):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be inside this job directory")
+    return resolved
+
+def _normalize_optional_at_file(job_id: str, value: Optional[str], field_name: str) -> Optional[str]:
+    if not value:
+        return value
+    s = value.strip()
+    if not s.startswith("@"):
+        return value
+    safe_path = _resolve_job_scoped_path(job_id, s[1:], field_name)
+    return "@" + safe_path
+
+def _client_host(request: Request) -> str:
+    host = (request.client.host if request.client else "") or ""
+    if TRUST_PROXY_HEADERS:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            host = xff.split(",", 1)[0].strip()
+    return host
+
+def _is_loopback(host: str) -> bool:
+    h = (host or "").strip()
+    if not h:
+        return False
+    if h.lower() in {"localhost", "testclient"}:
+        return True
+    if "%" in h:
+        h = h.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+def _extract_api_token(request: Request) -> str:
+    auth = (request.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    key = (request.headers.get("x-api-key") or "").strip()
+    if key:
+        return key
+    q = (request.query_params.get("api_token") or "").strip()
+    if q:
+        return q
+    return (request.cookies.get("text2dialog_api_token") or "").strip()
+
 def _job_dir(job_id: str) -> str:
-    d = os.path.join(JOBS_DIR, job_id)
+    jid = _require_job_id(job_id)
+    d = os.path.join(JOBS_DIR, jid)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -189,6 +273,30 @@ def _read_control(job_id: str) -> Dict[str, Any]:
 app = FastAPI(title="dialogue-chain UI", version="1.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+@app.middleware("http")
+async def access_guard(request: Request, call_next):
+    host = _client_host(request)
+    is_local = _is_loopback(host)
+    if not is_local:
+        if not ALLOW_REMOTE:
+            return JSONResponse(status_code=403, content={"detail": "remote access is disabled"})
+        if not REMOTE_API_TOKEN:
+            return JSONResponse(status_code=403, content={"detail": "remote access requires TEXT2DIALOG_API_TOKEN"})
+        token = _extract_api_token(request)
+        if not token or not hmac.compare_digest(token, REMOTE_API_TOKEN):
+            return JSONResponse(status_code=401, content={"detail": "invalid api token"})
+    response = await call_next(request)
+    q_token = (request.query_params.get("api_token") or "").strip()
+    if (not is_local) and q_token and REMOTE_API_TOKEN and hmac.compare_digest(q_token, REMOTE_API_TOKEN):
+        response.set_cookie(
+            "text2dialog_api_token",
+            q_token,
+            httponly=True,
+            samesite="lax",
+            secure=False,
+        )
+    return response
+
 class ExtractReq(BaseModel):
     platform: Optional[str] = Field(None)
     api_key: Optional[str] = None
@@ -263,9 +371,15 @@ def download(job_id: str, which: str):
     job = _load_job(job_id)
     art = job.get("artifacts", {})
     path = art.get(which)
-    if not path or not os.path.exists(path):
+    if not path:
         raise HTTPException(status_code=404, detail=f"{which} not found")
-    return FileResponse(path, filename=os.path.basename(path))
+    try:
+        safe_path = _resolve_job_scoped_path(job_id, str(path), f"artifact:{which}")
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=f"{which} not found")
+    if not os.path.exists(safe_path):
+        raise HTTPException(status_code=404, detail=f"{which} not found")
+    return FileResponse(safe_path, filename=os.path.basename(safe_path))
 
 # ---- 子进程：执行抽取 ----
 def _worker_extract(job_id: str, req_body: Dict[str, Any]) -> None:
@@ -418,9 +532,14 @@ class ValidateReq(BaseModel):
 @app.post("/api/validate")
 def run_validate(req: ValidateReq):
     _import_project_modules()
-    job = _load_job(req.job_id)
-    src = req.input_path or job.get("artifacts", {}).get("extraction")
-    if not src or not os.path.exists(src): raise HTTPException(status_code=400, detail="没有可校验的文件")
+    job_id = _require_job_id(req.job_id)
+    job = _load_job(job_id)
+    src_raw = req.input_path or job.get("artifacts", {}).get("extraction")
+    if not src_raw:
+        raise HTTPException(status_code=400, detail="no input file available for validate")
+    src = _resolve_job_scoped_path(job_id, str(src_raw), "input_path")
+    if not os.path.exists(src):
+        raise HTTPException(status_code=400, detail="no input file available for validate")
     import contextlib
     buf = io.StringIO()
     ok = False
@@ -428,17 +547,17 @@ def run_validate(req: ValidateReq):
         try:
             code = validator.validate(src); ok = (code == 0)
         except Exception as e:
-            msg = f"validate 运行错误：{e}"
+            msg = f"validate runtime error: {e}"
             return {"ok": False, "log": msg + "\n" + buf.getvalue()}
     log = buf.getvalue()
     if ok:
-        # 写一份校验后的文件
-        dst = os.path.join(_job_dir(req.job_id), "extraction.validated.jsonl")
+        # write a validated copy under this job
+        dst = os.path.join(_job_dir(job_id), "extraction.validated.jsonl")
         with open(src, "r", encoding="utf-8") as fr, open(dst, "w", encoding="utf-8") as fw:
             for line in fr:
                 fw.write(line)
-        arts = {**_load_job(req.job_id)["artifacts"], "validated": dst}
-        _update_job(req.job_id, artifacts=arts)
+        arts = {**_load_job(job_id)["artifacts"], "validated": dst}
+        _update_job(job_id, artifacts=arts)
         return {"ok": True, "log": log}
     return {"ok": False, "log": log}
 
@@ -463,14 +582,21 @@ class PairBuildReq(BaseModel):
 @app.post("/api/pairs")
 def build_pairs(req: PairBuildReq):
     _import_project_modules()
-    job = _load_job(req.job_id)
-    src = req.input_path or job.get("artifacts", {}).get("validated") or job.get("artifacts", {}).get("extraction")
-    if not src or not os.path.exists(src):
-        raise HTTPException(status_code=400, detail="没有可用的 JSONL 输入")
-    out_dir = req.out_dir or os.path.join(_job_dir(req.job_id), "pair_datasets")
-    os.makedirs(out_dir, exist_ok=True)
+    job_id = _require_job_id(req.job_id)
+    job = _load_job(job_id)
+    src_raw = req.input_path or job.get("artifacts", {}).get("validated") or job.get("artifacts", {}).get("extraction")
+    if not src_raw:
+        raise HTTPException(status_code=400, detail="no usable JSONL input")
+    src = _resolve_job_scoped_path(job_id, str(src_raw), "input_path")
+    if not os.path.exists(src):
+        raise HTTPException(status_code=400, detail="no usable JSONL input")
 
-    # 支持列出角色
+    out_dir_raw = req.out_dir or os.path.join(_job_dir(job_id), "pair_datasets")
+    out_dir = _resolve_job_scoped_path(job_id, out_dir_raw, "out_dir")
+    os.makedirs(out_dir, exist_ok=True)
+    merge_out = _resolve_job_scoped_path(job_id, req.merge_out, "merge_out") if req.merge_out else None
+
+    # support listing roles only
     if req.list_roles:
         try:
             counts = pair_builder.list_roles(Path(src))
@@ -479,7 +605,7 @@ def build_pairs(req: PairBuildReq):
             roles = []
         return {"roles": roles}
 
-    # 展开 req.pairs 中的通配 ALL/全部 为显式 'A,B'
+    # expand ALL to explicit 'A,B'
     def _all_roles() -> List[str]:
         try:
             counts = pair_builder.list_roles(Path(src))
@@ -498,19 +624,21 @@ def build_pairs(req: PairBuildReq):
             if s.upper() in ("ALL", "全部"):
                 for a in roles_for_expand:
                     for b in roles_for_expand:
-                        if a != b: expanded_pairs.append(f"{a},{b}")
+                        if a != b:
+                            expanded_pairs.append(f"{a},{b}")
             elif "," in s:
                 expanded_pairs.append(s)
-        # 去重
+        # dedupe while preserving order
         seen = set()
         req.pairs = [p for p in expanded_pairs if (p not in seen and not seen.add(p))]
 
     argv: List[str] = ["--input", src, "--out", out_dir]
-    if req.merge_out: argv = ["--input", src, "--merge-out", req.merge_out]
+    if merge_out:
+        argv = ["--input", src, "--merge-out", merge_out]
     if req.pairs:
         argv.extend(["--pairs"] + req.pairs)
 
-    # 统一处理 roles，避免重复 --roles 导致 argparse 覆盖
+    # normalize roles args to avoid repeated --roles overriding
     roles_args: List[str] = []
     if req.all_ordered_pairs:
         roles_args = req.roles or _all_roles()
@@ -518,25 +646,36 @@ def build_pairs(req: PairBuildReq):
         roles_args = req.roles
     if roles_args:
         argv.extend(["--roles"] + roles_args)
-    if req.all_ordered_pairs: argv.append("--all-ordered-pairs")
+    if req.all_ordered_pairs:
+        argv.append("--all-ordered-pairs")
 
-    if req.min_confidence is not None: argv += ["--min-confidence", str(req.min_confidence)]
-    if req.require_confidence: argv.append("--require-confidence")
-    if req.strict: argv.append("--strict")
-    else: argv.append("--no-strict")
-    if req.min_src_chars is not None: argv += ["--min-src-chars", str(req.min_src_chars)]
-    if req.min_reply_chars is not None: argv += ["--min-reply-chars", str(req.min_reply_chars)]
-    if req.max_src_chars is not None: argv += ["--max-src-chars", str(req.max_src_chars)]
-    if req.max_reply_chars is not None: argv += ["--max-reply-chars", str(req.max_reply_chars)]
-    if req.deny_pattern: [argv.extend(["--deny-pattern", pat]) for pat in req.deny_pattern]
-    if req.list_roles: argv.append("--list-roles")
+    if req.min_confidence is not None:
+        argv += ["--min-confidence", str(req.min_confidence)]
+    if req.require_confidence:
+        argv.append("--require-confidence")
+    if req.strict:
+        argv.append("--strict")
+    else:
+        argv.append("--no-strict")
+    if req.min_src_chars is not None:
+        argv += ["--min-src-chars", str(req.min_src_chars)]
+    if req.min_reply_chars is not None:
+        argv += ["--min-reply-chars", str(req.min_reply_chars)]
+    if req.max_src_chars is not None:
+        argv += ["--max-src-chars", str(req.max_src_chars)]
+    if req.max_reply_chars is not None:
+        argv += ["--max-reply-chars", str(req.max_reply_chars)]
+    if req.deny_pattern:
+        [argv.extend(["--deny-pattern", pat]) for pat in req.deny_pattern]
+    if req.list_roles:
+        argv.append("--list-roles")
 
     code = pair_builder.main(argv)
-    if code != 0: return {"ok": False, "log": "pair_dataset_builder: 非零退出"}
+    if code != 0:
+        return {"ok": False, "log": "pair_dataset_builder: non-zero exit"}
 
-    zip_path = os.path.join(_job_dir(req.job_id), "pairs.zip")
+    zip_path = os.path.join(_job_dir(job_id), "pairs.zip")
     if os.path.exists(out_dir):
-        # 简单打包
         import zipfile
         with zipfile.ZipFile(zip_path, "w") as zf:
             for root, _, files in os.walk(out_dir):
@@ -544,7 +683,7 @@ def build_pairs(req: PairBuildReq):
                     fp = os.path.join(root, fn)
                     zf.write(fp, arcname=os.path.relpath(fp, out_dir))
     if os.path.exists(zip_path):
-        _update_job(req.job_id, artifacts={**_load_job(req.job_id)["artifacts"], "pairs_zip": zip_path})
+        _update_job(job_id, artifacts={**_load_job(job_id)["artifacts"], "pairs_zip": zip_path})
     return {"ok": True, "out_dir": out_dir, "zip": zip_path}
 
 class ChatMLReq(BaseModel):
@@ -563,11 +702,17 @@ class ChatMLReq(BaseModel):
 @app.post("/api/chatml")
 def build_chatml(req: ChatMLReq):
     _import_project_modules()
-    job = _load_job(req.job_id)
-    inputs = req.input or os.path.join(_job_dir(req.job_id), "pair_datasets")
-    out = req.out or os.path.join(_job_dir(req.job_id), "chatml.jsonl")
+    job_id = _require_job_id(req.job_id)
+    job = _load_job(job_id)
+    inputs_raw = req.input or os.path.join(_job_dir(job_id), "pair_datasets")
+    out_raw = req.out or os.path.join(_job_dir(job_id), "chatml.jsonl")
+    inputs = _resolve_job_scoped_path(job_id, inputs_raw, "input")
+    out = _resolve_job_scoped_path(job_id, out_raw, "out")
 
-    # 通过 pair_to_chatml.py 的 CLI 入口
+    safe_system_template = _normalize_optional_at_file(job_id, req.system_template, "system_template")
+    safe_system_text = _normalize_optional_at_file(job_id, req.system_text, "system_text")
+
+    # use pair_to_chatml.py CLI entry
     argv = [
         "-i", inputs,
         "-o", out,
@@ -579,17 +724,19 @@ def build_chatml(req: ChatMLReq):
         argv.extend(["--max-turns", str(max(1, int(req.max_turns)))])
     if req.dedupe:
         argv.append("--dedupe")
-    if req.reverse: argv.append("--reverse")
-    if req.include_meta: argv.append("--include-meta")
-    if req.system_template:
-        argv.extend(["--system-template", req.system_template])
-    elif req.system_text:
-        argv.extend(["--system", req.system_text])
+    if req.reverse:
+        argv.append("--reverse")
+    if req.include_meta:
+        argv.append("--include-meta")
+    if safe_system_template:
+        argv.extend(["--system-template", safe_system_template])
+    elif safe_system_text:
+        argv.extend(["--system", safe_system_text])
 
     code = p2c.main(argv)
     if code != 0:
-        return {"ok": False, "log": "pair_to_chatml: 非零退出"}
-    _update_job(req.job_id, artifacts={**job.get("artifacts", {}), "chatml": out})
+        return {"ok": False, "log": "pair_to_chatml: non-zero exit"}
+    _update_job(job_id, artifacts={**job.get("artifacts", {}), "chatml": out})
     return {"ok": True, "out": out}
 
 def _all_roles_from_pairs(job_id: str) -> Dict[str, int]:

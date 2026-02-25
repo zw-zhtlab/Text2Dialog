@@ -8,4 +8,6 @@ call ".venv\Scripts\activate"
 python -m pip install --upgrade pip
 python -m pip install -r "text2dialog\requirements.txt"
 cd text2dialog
-python -m uvicorn server:app --host 0.0.0.0 --port 8000
+if "%TEXT2DIALOG_HOST%"=="" set "TEXT2DIALOG_HOST=127.0.0.1"
+if "%TEXT2DIALOG_PORT%"=="" set "TEXT2DIALOG_PORT=8000"
+python -m uvicorn server:app --host %TEXT2DIALOG_HOST% --port %TEXT2DIALOG_PORT%

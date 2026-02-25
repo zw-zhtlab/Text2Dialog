@@ -15,7 +15,7 @@ Text2Dialog 是一个将长文本（如小说、剧本）自动抽取为结构�
 
 - **如何开始**
   - 图形化：`python launcher.py` 一键创建虚拟环境、安装依赖、启动服务与前端。
-  - 服务端：`pip install -r text2dialog/requirements.txt` → `uvicorn server:app --host 0.0.0.0 --port 8000`
+  - 服务端：`pip install -r text2dialog/requirements.txt` → `uvicorn server:app --host 127.0.0.1 --port 8000`
   - 命令行：`python text2dialog/dialogue_chain.py input.txt -o out.jsonl --concurrent -t 8`
 
 ---
