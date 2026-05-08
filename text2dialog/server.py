@@ -17,6 +17,7 @@ import uuid
 import signal
 import hmac
 import ipaddress
+from collections import Counter
 from contextlib import contextmanager
 from typing import Optional, Dict, Any, List
 try:
@@ -65,8 +66,7 @@ for d in POSSIBLE_DIRS:
     if os.path.exists(os.path.join(d, "dialogue_chain.py")) and d not in sys.path:
         sys.path.insert(0, d)
 
-# ---- 延迟导入（修复脚本中可能出现的中文引号等问题） ----
-# 如果你是专业人士或者特别在意复杂度的算竟选手可以将这部分删去:)
+# ---- 延迟导入 ----
 DialogueChain = None
 Config = None
 ModelPlatform = None
@@ -88,30 +88,8 @@ def _import_project_modules():
         DialogueChain, Config, ModelPlatform = _DC, _CFG, _MP
         validator, pair_builder, p2c = _V, _PB, _P2C
         CancelledErrorCls = _CE
-    except SyntaxError:
-        # 若因全角符号/智能引号导致语法错误，尝试修复 dialogue_chain.py 后再导入一次
-        cand = None
-        for d in sys.path:
-            fp = os.path.join(d, "dialogue_chain.py")
-            if os.path.exists(fp):
-                cand = fp; break
-        if not cand:
-            raise
-        # 粗略修正智能引号与破折号
-        txt = open(cand, "r", encoding="utf-8").read()
-        orig = txt
-        txt = txt.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
-        txt = txt.replace("—", "-").replace("…", "...")
-        if txt != orig:
-            with open(cand, "w", encoding="utf-8") as f: f.write(txt)
-        from dialogue_chain import DialogueChain as _DC2, CancelledError as _CE2
-        from config import Config as _CFG2, ModelPlatform as _MP2
-        import validate_output as _V2
-        import pair_dataset_builder as _PB2
-        import pair_to_chatml as _P2C2
-        DialogueChain, Config, ModelPlatform = _DC2, _CFG2, _MP2
-        validator, pair_builder, p2c = _V2, _PB2, _P2C2
-        CancelledErrorCls = _CE2
+    except SyntaxError as exc:
+        raise RuntimeError("导入项目模块失败，请检查 dialogue_chain.py 语法") from exc
 
 # ---- 工具函数 ----
 _JOBS: Dict[str, Dict[str, Any]] = {}
@@ -186,10 +164,11 @@ def _extract_api_token(request: Request) -> str:
         return q
     return (request.cookies.get("text2dialog_api_token") or "").strip()
 
-def _job_dir(job_id: str) -> str:
+def _job_dir(job_id: str, *, create: bool = True) -> str:
     jid = _require_job_id(job_id)
     d = os.path.join(JOBS_DIR, jid)
-    os.makedirs(d, exist_ok=True)
+    if create:
+        os.makedirs(d, exist_ok=True)
     return d
 
 def _save_job(job_id: str) -> None:
@@ -199,7 +178,7 @@ def _save_job(job_id: str) -> None:
 
 def _load_job(job_id: str) -> Dict[str, Any]:
     # 始终以磁盘为准，避免多进程更新不一致
-    d = _job_dir(job_id); fp = os.path.join(d, "job.json")
+    d = _job_dir(job_id, create=False); fp = os.path.join(d, "job.json")
     if os.path.exists(fp):
         with open(fp, "r", encoding="utf-8") as f:
             job = json.load(f)
@@ -276,6 +255,31 @@ def _job_start_lock(job_id: str):
 
 def _update_job(job_id: str, **patch: Any) -> None:
     job = _load_job(job_id); job.update(patch); _save_job(job_id)
+
+def _set_job_artifact(job_id: str, name: str, path: str, **patch: Any) -> Dict[str, Any]:
+    artifacts = dict((_load_job(job_id).get("artifacts") or {}))
+    artifacts[name] = path
+    _update_job(job_id, artifacts=artifacts, **patch)
+    return artifacts
+
+def _summarize_diagnostics(path: str) -> Dict[str, Any]:
+    total = 0
+    by_action: Counter[str] = Counter()
+    by_reason: Counter[str] = Counter()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                total += 1
+                if obj.get("action"):
+                    by_action[str(obj.get("action"))] += 1
+                if obj.get("reason"):
+                    by_reason[str(obj.get("reason"))] += 1
+    except Exception:
+        pass
+    return {"events": total, "by_action": dict(by_action), "by_reason": dict(by_reason)}
 
 def _read_progress(cache_dir: str) -> Dict[str, Any]:
     if not cache_dir: return {}
@@ -480,9 +484,14 @@ def _worker_extract(job_id: str, req_body: Dict[str, Any]) -> None:
         Config.CACHE_DIR = cache_dir
 
         out_file = os.path.join(_job_dir(job_id), "extraction.jsonl")
-        existing_artifacts = dict(_load_job(job_id).get("artifacts", {}))
-        existing_artifacts["extraction"] = out_file
-        _update_job(job_id, status="running", message="正在提取对话…", cache_dir=cache_dir, artifacts=existing_artifacts)
+        _set_job_artifact(
+            job_id,
+            "extraction",
+            out_file,
+            status="running",
+            message="正在提取对话…",
+            cache_dir=cache_dir,
+        )
 
         extractor = DialogueChain(
             schema=None,
@@ -507,12 +516,19 @@ def _worker_extract(job_id: str, req_body: Dict[str, Any]) -> None:
 
         if req_body.get("sort_output") or getattr(Config, "DEFAULT_SORT_OUTPUT", False):
             sorted_path = extractor.sort_dialogues(out_file)
-            art = _load_job(job_id).get("artifacts", {})
-            art["extraction"] = sorted_path
-            _update_job(job_id, artifacts=art)
+            _set_job_artifact(job_id, "extraction", sorted_path)
 
-        stats = extractor.get_statistics(_load_job(job_id)["artifacts"]["extraction"])
-        _update_job(job_id, status="succeeded", message="对话提取完成", stats=stats)
+        extraction_path = _load_job(job_id)["artifacts"]["extraction"]
+        quality_report = extractor.write_quality_report(extraction_path)
+        _set_job_artifact(job_id, "quality_report", quality_report)
+        stats = extractor.get_statistics(extraction_path)
+        _update_job(
+            job_id,
+            status="succeeded",
+            message="对话提取完成",
+            stats=stats,
+            quality_summary=extractor._quality_summary(),
+        )
     except Exception as e:
         _update_job(job_id, status="failed", message=f"提取失败：{e}")
     finally:
@@ -528,6 +544,7 @@ async def run_extract(job_id: str, request: Request):
     _import_project_modules()
     body = await request.json()
     req = ExtractReq(**body)
+    _load_job_or_404(job_id)
     with _job_start_lock(job_id):
         # 立即读取并验证
         job = _load_job_or_404(job_id)
@@ -614,26 +631,40 @@ def run_validate(req: ValidateReq):
     src = _resolve_job_scoped_path(job_id, str(src_raw), "input_path")
     if not os.path.exists(src):
         raise HTTPException(status_code=400, detail="no input file available for validate")
-    import contextlib
-    buf = io.StringIO()
-    ok = False
-    with contextlib.redirect_stderr(buf):
-        try:
-            code = validator.validate(src); ok = (code == 0)
-        except Exception as e:
-            msg = f"validate runtime error: {e}"
-            return {"ok": False, "log": msg + "\n" + buf.getvalue()}
-    log = buf.getvalue()
+    try:
+        if hasattr(validator, "validate_with_report"):
+            report = validator.validate_with_report(src)
+        else:
+            import contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                code = validator.validate(src)
+            report = {
+                "ok": code == 0,
+                "status": "通过" if code == 0 else "失败",
+                "error_count": 0 if code == 0 else 1,
+                "messages": [line for line in buf.getvalue().splitlines() if line.strip()],
+            }
+    except Exception as e:
+        msg = f"validate runtime error: {e}"
+        return {"ok": False, "log": msg, "report": {"ok": False, "messages": [msg]}}
+
+    log = "\n".join(report.get("messages", []))
+    report_path = os.path.join(_job_dir(job_id), "validation.report.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    _set_job_artifact(job_id, "validation_report", report_path, validation_summary=report)
+
+    ok = bool(report.get("ok"))
     if ok:
         # write a validated copy under this job
         dst = os.path.join(_job_dir(job_id), "extraction.validated.jsonl")
         with open(src, "r", encoding="utf-8") as fr, open(dst, "w", encoding="utf-8") as fw:
             for line in fr:
                 fw.write(line)
-        arts = {**_load_job(job_id)["artifacts"], "validated": dst}
-        _update_job(job_id, artifacts=arts)
-        return {"ok": True, "log": log}
-    return {"ok": False, "log": log}
+        _set_job_artifact(job_id, "validated", dst)
+        return {"ok": True, "log": log, "report": report}
+    return {"ok": False, "log": log, "report": report}
 
 class PairBuildReq(BaseModel):
     job_id: str
@@ -706,9 +737,10 @@ def build_pairs(req: PairBuildReq):
         seen = set()
         req.pairs = [p for p in expanded_pairs if (p not in seen and not seen.add(p))]
 
-    argv: List[str] = ["--input", src, "--out", out_dir]
+    diagnostics_out = os.path.join(_job_dir(job_id), "pairs.diagnostics.jsonl")
+    argv: List[str] = ["--input", src, "--out", out_dir, "--diagnostics-out", diagnostics_out]
     if merge_out:
-        argv = ["--input", src, "--merge-out", merge_out]
+        argv = ["--input", src, "--merge-out", merge_out, "--diagnostics-out", diagnostics_out]
     if req.pairs:
         argv.extend(["--pairs"] + req.pairs)
 
@@ -757,8 +789,16 @@ def build_pairs(req: PairBuildReq):
                     fp = os.path.join(root, fn)
                     zf.write(fp, arcname=os.path.relpath(fp, out_dir))
     if os.path.exists(zip_path):
-        _update_job(job_id, artifacts={**_load_job(job_id)["artifacts"], "pairs_zip": zip_path})
-    return {"ok": True, "out_dir": out_dir, "zip": zip_path}
+        _set_job_artifact(job_id, "pairs_zip", zip_path)
+    pair_diag_summary = _summarize_diagnostics(diagnostics_out)
+    if os.path.exists(diagnostics_out):
+        _set_job_artifact(
+            job_id,
+            "pair_diagnostics",
+            diagnostics_out,
+            pair_quality_summary=pair_diag_summary,
+        )
+    return {"ok": True, "out_dir": out_dir, "zip": zip_path, "diagnostics": pair_diag_summary}
 
 class ChatMLReq(BaseModel):
     job_id: str
@@ -810,7 +850,7 @@ def build_chatml(req: ChatMLReq):
     code = p2c.main(argv)
     if code != 0:
         return {"ok": False, "log": "pair_to_chatml: non-zero exit"}
-    _update_job(job_id, artifacts={**job.get("artifacts", {}), "chatml": out})
+    _set_job_artifact(job_id, "chatml", out)
     return {"ok": True, "out": out}
 
 def _all_roles_from_pairs(job_id: str) -> Dict[str, int]:
@@ -833,7 +873,7 @@ def _all_roles_from_pairs(job_id: str) -> Dict[str, int]:
         return [r for r in roles if r]
 
     try:
-        ds_dir = os.path.join(_job_dir(job_id), "pair_datasets")
+        ds_dir = os.path.join(_job_dir(job_id, create=False), "pair_datasets")
         if not os.path.isdir(ds_dir):
             return {}
         from collections import Counter

@@ -15,6 +15,9 @@ import logging
 import threading
 import statistics
 import shutil
+import math
+from datetime import datetime, timezone
+from collections import Counter
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from typing import Dict, List, Any, Optional, Set
@@ -179,7 +182,7 @@ class ThreadSafeDialogueChain:
             )
             # 途中可能被用户请求取消，避免继续处理
             self.extractor.control.raise_if_cancelled()
-            dialogues = self.extractor._parse_and_validate_response(response)
+            dialogues = self.extractor._parse_and_validate_response(response, chunk_id=work_item.chunk_id)
 
             # 线程安全地转换为标准输出
             with self.lock:
@@ -308,6 +311,10 @@ class DialogueChain:
 
         # 进度计时起点（用于速度/ETA）
         self._progress_t0: Optional[float] = None
+
+        # 质量诊断事件，不写入主 JSONL，按需生成 sidecar 报告。
+        self.quality_events: List[Dict[str, Any]] = []
+        self._quality_lock = threading.Lock()
 
     # ---------- 提示词 ----------
     def _generate_system_prompt(self) -> str:
@@ -650,32 +657,115 @@ IMPORTANT GUIDELINES:
             raise last_err
         raise RuntimeError("API 调用失败")
 
+    # ---------- 质量诊断 ----------
+    @staticmethod
+    def _preview_text(value: Any, limit: int = 80) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    def _record_quality_event(self, **event: Any) -> None:
+        item = {"stage": "extract", **event}
+        if not hasattr(self, "quality_events"):
+            self.quality_events = []
+        lock = getattr(self, "_quality_lock", None)
+        if lock:
+            with lock:
+                self.quality_events.append(item)
+        else:
+            self.quality_events.append(item)
+
+    def _quality_summary(self) -> Dict[str, Any]:
+        events = list(getattr(self, "quality_events", []))
+        by_action = Counter(str(e.get("action", "")) for e in events if e.get("action"))
+        by_reason = Counter(str(e.get("reason", "")) for e in events if e.get("reason"))
+        by_chunk = Counter(str(e.get("chunk_id")) for e in events if e.get("chunk_id") is not None)
+        return {
+            "events": len(events),
+            "by_action": dict(by_action),
+            "by_reason": dict(by_reason),
+            "by_chunk": dict(by_chunk),
+        }
+
+    def write_quality_report(self, output_file: str, report_file: Optional[str] = None) -> str:
+        """写出抽取质量诊断 sidecar，用于解释接受/清洗/丢弃/降级原因。"""
+        if report_file is None:
+            out_path = Path(output_file)
+            report_file = str(out_path.with_name(f"{out_path.stem}.quality.json"))
+
+        report = {
+            "schema_version": "1.0",
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "output_file": str(output_file),
+            "summary": self._quality_summary(),
+            "events": list(getattr(self, "quality_events", [])),
+        }
+        Path(report_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(report_file, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        return report_file
+
     # ---------- 解析与清洗 ----------
-    def _clean_reply(self, current_index: int, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """清洗模型返回的 reply 字段。"""
+    def _clean_reply_with_reason(
+        self,
+        current_index: int,
+        item: Dict[str, Any],
+        prior_dialogues: Optional[List[DialogueItem]] = None,
+    ) -> tuple[Optional[Dict[str, Any]], str]:
+        """清洗 reply 并返回可解释原因。"""
         reply = item.get("reply")
+        if reply is None:
+            return None, "reply_absent"
         if not isinstance(reply, dict):
-            return None
+            return None, "reply_not_object"
 
         target_index = reply.get("target_index")
-        if not isinstance(target_index, int):
-            return None
+        if not isinstance(target_index, int) or isinstance(target_index, bool):
+            return None, "target_index_not_int"
         if target_index < 0 or target_index >= current_index:
-            return None
+            return None, "target_index_not_previous"
         if (current_index - target_index) > self._effective_reply_window():
-            return None
+            return None, "target_gap_exceeds_window"
 
         confidence = reply.get("confidence", 1.0)
-        if not isinstance(confidence, (int, float)):
-            return None
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+            return None, "confidence_not_number"
         confidence_value = float(confidence)
+        if not math.isfinite(confidence_value) or not (0.0 <= confidence_value <= 1.0):
+            return None, "confidence_out_of_range"
         if confidence_value < float(getattr(Config, "REPLY_CONFIDENCE_TH", 0.0)):
-            return None
+            return None, "confidence_below_threshold"
+
+        target_role: Optional[str] = None
+        if "target_role" in reply and reply["target_role"] is not None:
+            target_role = str(reply["target_role"]).strip()
+
+        if prior_dialogues is not None:
+            if target_index >= len(prior_dialogues):
+                return None, "target_index_missing"
+            current_role = str(item.get("role", "")).strip()
+            actual_target_role = prior_dialogues[target_index].role.strip()
+            if not actual_target_role or actual_target_role == current_role:
+                return None, "target_same_speaker"
+            if target_role and target_role != actual_target_role:
+                return None, "target_role_mismatch"
+            target_role = actual_target_role
 
         cleaned: Dict[str, Any] = {"target_index": target_index}
-        if "target_role" in reply and reply["target_role"] is not None:
-            cleaned["target_role"] = str(reply["target_role"])
+        if target_role:
+            cleaned["target_role"] = target_role
         cleaned["confidence"] = confidence_value
+        return cleaned, "reply_accepted"
+
+    def _clean_reply(
+        self,
+        current_index: int,
+        item: Dict[str, Any],
+        prior_dialogues: Optional[List[DialogueItem]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """清洗模型返回的 reply 字段。"""
+        cleaned, _reason = self._clean_reply_with_reason(current_index, item, prior_dialogues)
         return cleaned
 
     def _extract_first_json_array(self, text: str) -> Optional[str]:
@@ -727,13 +817,19 @@ IMPORTANT GUIDELINES:
                             break
         return None
 
-    def _parse_and_validate_response(self, response: str) -> List[DialogueItem]:
+    def _parse_and_validate_response(self, response: str, chunk_id: Optional[int] = None) -> List[DialogueItem]:
         """解析并验证 API 响应，返回对话中间结构列表。"""
         text = response or ""
         # 统一的错误报告（截断长响应以便日志阅读）
         def _fail(msg: str) -> List[DialogueItem]:
             snippet = re.sub(r"\s+", " ", text.strip())[:400]
             logger.error(f"{msg} | 片段: {snippet}")
+            self._record_quality_event(
+                chunk_id=chunk_id,
+                action="rejected_response",
+                reason=msg,
+                response_preview=snippet,
+            )
             if bool(getattr(Config, "FAIL_ON_PARSE_ERROR", False)):
                 raise ValueError(msg)
             return []
@@ -761,17 +857,47 @@ IMPORTANT GUIDELINES:
             return _fail("响应不是列表格式，已尝试纠正失败")
 
         dialogues: List[DialogueItem] = []
-        for item in data:
+        for raw_index, item in enumerate(data):
             if isinstance(item, dict) and "role" in item and "dialogue" in item:
                 role = str(item["role"]).strip()
                 content = str(item["dialogue"]).strip()
                 if role and content:
-                    reply = self._clean_reply(len(dialogues), item)
+                    dialogue_index = len(dialogues)
+                    reply, reply_reason = self._clean_reply_with_reason(dialogue_index, item, dialogues)
+                    action = "accepted"
+                    if reply_reason == "reply_accepted":
+                        action = "cleaned_reply"
+                    elif reply_reason != "reply_absent":
+                        action = "downgraded_reply"
+                    self._record_quality_event(
+                        chunk_id=chunk_id,
+                        raw_index=raw_index,
+                        dialogue_index=dialogue_index,
+                        action=action,
+                        reason=reply_reason,
+                        role=role,
+                        dialogue_preview=self._preview_text(content),
+                    )
                     dialogues.append(DialogueItem(role=role, dialogue=content, reply=reply))
                 else:
                     logger.warning(f"跳过空对话项：{item}")
+                    self._record_quality_event(
+                        chunk_id=chunk_id,
+                        raw_index=raw_index,
+                        action="discarded_item",
+                        reason="empty_role_or_dialogue",
+                        role=self._preview_text(item.get("role") if isinstance(item, dict) else ""),
+                        dialogue_preview=self._preview_text(item.get("dialogue") if isinstance(item, dict) else ""),
+                    )
             else:
                 logger.warning(f"跳过无效对话项：{item}")
+                self._record_quality_event(
+                    chunk_id=chunk_id,
+                    raw_index=raw_index,
+                    action="discarded_item",
+                    reason="missing_role_or_dialogue",
+                    item_type=type(item).__name__,
+                )
 
         return dialogues
 
@@ -818,6 +944,7 @@ IMPORTANT GUIDELINES:
             "timestamp": now,
         }
         try:
+            Path(pf).parent.mkdir(parents=True, exist_ok=True)
             with open(pf, "w", encoding="utf-8") as f:
                 json.dump(progress_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -1047,7 +1174,7 @@ IMPORTANT GUIDELINES:
 
                 try:
                     response = self._call_api_with_retry(system_prompt, chunk)
-                    dialogues = self._parse_and_validate_response(response)
+                    dialogues = self._parse_and_validate_response(response, chunk_id=i)
 
                     unique_dialogues = self._remove_duplicates(dialogues)
 
@@ -1452,8 +1579,12 @@ IMPORTANT GUIDELINES:
             pass
 
         if sorted_output_file is None:
-            base_name = Path(output_file).stem
-            sorted_output_file = f"{base_name}_sorted.{getattr(Config, 'OUTPUT_FORMAT', 'jsonl')}"
+            output_path = Path(output_file)
+            sorted_output_file = str(
+                output_path.with_name(
+                    f"{output_path.stem}_sorted.{getattr(Config, 'OUTPUT_FORMAT', 'jsonl')}"
+                )
+            )
 
         try:
             dialogues: List[Dict[str, Any]] = []
@@ -1491,9 +1622,13 @@ IMPORTANT GUIDELINES:
     def filter_by_chunk(self, output_file: str, chunk_ids: List[int], filtered_output_file: Optional[str] = None) -> str:
         """按 chunk_id 过滤对话并保存到新文件。"""
         if filtered_output_file is None:
-            base_name = Path(output_file).stem
+            output_path = Path(output_file)
             chunk_str = "_".join(map(str, sorted(set(chunk_ids))))
-            filtered_output_file = f"{base_name}_chunks_{chunk_str}.{getattr(Config, 'OUTPUT_FORMAT', 'jsonl')}"
+            filtered_output_file = str(
+                output_path.with_name(
+                    f"{output_path.stem}_chunks_{chunk_str}.{getattr(Config, 'OUTPUT_FORMAT', 'jsonl')}"
+                )
+            )
 
         try:
             filtered_dialogues: List[Dict[str, Any]] = []

@@ -10,11 +10,14 @@
 <header class="site-header">
   <div class="container header-bar">
     <div class="brand">
-      <h1>Text2Dialog 可视化控制台</h1>
-      <p class="subtitle">上传文本 → 提取角色对话 → 校验 → 角色对配对 → 导出 ChatML 数据集</p>
+      <span class="brand-mark" aria-hidden="true">T2D</span>
+      <div>
+        <h1>Text2Dialog 可视化控制台</h1>
+        <p class="subtitle">上传文本 → 提取角色对话 → 校验 → 角色对配对 → 导出 ChatML 数据集</p>
+      </div>
     </div>
     <div class="header-right">
-      <label for="themeSelect" class="theme-label"></label>
+      <label for="themeSelect" class="theme-label">主题</label>
       <select id="themeSelect" class="theme-switch" aria-label="主题切换">
         <option value="dark">暗色</option>
         <option value="light-doc">亮色</option>
@@ -23,81 +26,117 @@
   </div>
 </header>
 
-<main class="container">
-  <section class="card">
-    <h2>① 上传文本</h2>
-    <p class="hint">支持 .txt；拖拽或点击选择。</p>
-    <div id="dropzone" class="dropzone" aria-label="上传文本区域">将文件拖到这里，或 <button id="pick" class="linklike" type="button">选择文件</button></div>
+<main class="container app-main">
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <div class="app-shell">
+    <nav id="workflow" class="workflow" aria-label="任务流程">
+      <div class="workflow-step" data-step="upload">
+        <span class="step-index">1</span>
+        <span>上传</span>
+      </div>
+      <div class="workflow-step" data-step="extract">
+        <span class="step-index">2</span>
+        <span>抽取</span>
+      </div>
+      <div class="workflow-step" data-step="validate">
+        <span class="step-index">3</span>
+        <span>校验</span>
+      </div>
+      <div class="workflow-step" data-step="pairs">
+        <span class="step-index">4</span>
+        <span>配对</span>
+      </div>
+      <div class="workflow-step" data-step="chatml">
+        <span class="step-index">5</span>
+        <span>导出</span>
+      </div>
+    </nav>
+
+    <div class="content-stack">
+  <section class="card section-upload" data-step-panel="upload">
+    <div class="section-head">
+      <h2><span class="section-num">01</span>上传文本</h2>
+      <span class="section-status" id="uploadState">待上传</span>
+    </div>
+    <div id="dropzone" class="dropzone" aria-label="上传文本区域">
+      <span class="dropzone-icon" aria-hidden="true"></span>
+      <span class="dropzone-title">拖入 TXT 文本，或 <button id="pick" class="linklike" type="button">选择文件</button></span>
+      <span class="dropzone-meta">上传后会创建独立 Job，运行产物保存在本地 jobs 目录</span>
+    </div>
     <input id="file" type="file" accept=".txt" hidden>
     <div id="uploadResult" class="muted"></div>
   </section>
 
-  <section class="card">
-    <h2>② 运行设置</h2>
-    <div class="grid two">
-      <div>
+  <section class="card" data-step-panel="extract">
+    <div class="section-head">
+      <h2><span class="section-num">02</span>运行设置</h2>
+      <span class="section-status">平台配置</span>
+    </div>
+    <div class="grid two form-grid">
+      <div class="field">
         <label>平台</label>
         <select id="platform"></select>
       </div>
-      <div>
+      <div class="field">
         <label>模型名 <span class="muted">(可留空)</span></label>
         <input id="modelName" placeholder="如 gpt-4o-mini / deepseek-chat">
       </div>
-      <div>
+      <div class="field">
         <label>API Base URL <span class="muted">(可留空)</span></label>
         <input id="baseUrl" placeholder="如 https://api.openai.com/v1">
       </div>
-      <div>
+      <div class="field">
         <label>API Key <span class="muted">(仅本次运行)</span></label>
         <input id="apiKey" placeholder="sk-..." autocomplete="off">
       </div>
     </div>
 
-    <details class="mt">
+    <details class="mt advanced-panel">
       <summary>高级参数</summary>
-      <div class="grid three">
-        <div>
+      <div class="grid three form-grid">
+        <div class="field">
           <label>并发</label>
           <select id="concurrent">
             <option value="true" selected>多线程</option>
             <option value="false">单线程</option>
           </select>
         </div>
-        <div>
+        <div class="field">
           <label>线程数</label>
           <input id="threads" type="number" min="1" placeholder="默认">
         </div>
-        <div>
+        <div class="field">
           <label>温度</label>
           <input id="temperature" type="number" min="0" max="2" step="0.1" placeholder="默认">
         </div>
-        <div>
+        <div class="field">
           <label>Chunk 最大 Token</label>
           <input id="maxTokenLen" type="number" min="100" step="10" placeholder="默认">
         </div>
-        <div>
+        <div class="field">
           <label>前文覆盖 Token</label>
           <input id="coverContent" type="number" min="0" step="10" placeholder="默认">
         </div>
-        <div>
+        <div class="field">
           <label>保存原始 chunk 文本</label>
           <select id="saveChunkText">
             <option value="true">是</option>
             <option value="false" selected>否</option>
           </select>
         </div>
-        <div>
+        <div class="field">
           <label>完成后排序输出</label>
           <select id="sortOutput">
             <option value="false" selected>否</option>
             <option value="true">是</option>
           </select>
         </div>
-        <div>
+        <div class="field">
           <label>Reply 窗口</label>
           <input id="replyWindow" type="number" min="1" placeholder="默认">
         </div>
-        <div>
+        <div class="field">
           <label>Reply 置信度阈值</label>
           <input id="replyConf" type="number" min="0" max="1" step="0.05" placeholder="默认">
         </div>
@@ -109,13 +148,21 @@
       <button id="pause" disabled>暂停</button>
       <button id="resume" disabled>继续</button>
       <button id="cancel" disabled>取消</button>
-      <span id="status" class="status"></span>
     </div>
-    <progress id="bar" value="0" max="100" style="width:100%;display:none;"></progress>
+    <div class="run-feedback">
+      <div class="status-line">
+        <span id="status" class="status"></span>
+        <span id="eta" class="status secondary"></span>
+      </div>
+      <progress id="bar" value="0" max="100" style="width:100%;display:none;"></progress>
+    </div>
   </section>
 
-  <section class="card">
-    <h2>③ 校验与预览</h2>
+  <section class="card" data-step-panel="validate">
+    <div class="section-head">
+      <h2><span class="section-num">03</span>校验与预览</h2>
+      <span class="section-status">结果检查</span>
+    </div>
     <div class="actions">
       <button id="validate" disabled>校验 JSONL</button>
       <a id="downloadExtract" class="button" href="#" download disabled>下载提取结果</a>
@@ -146,27 +193,54 @@
         <button id="toggleRoles" class="linklike">展开全部</button>
       </div>
     </div>
+
+    <div id="qualityCard" class="stats" style="display:none;">
+      <h3>质量诊断</h3>
+      <div class="grid three">
+        <div class="kpi">
+          <div class="kpi-title">抽取诊断事件</div>
+          <div id="qualityEvents" class="kpi-value">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-title">校验问题</div>
+          <div id="validationIssues" class="kpi-value">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-title">配对诊断事件</div>
+          <div id="pairQualityEvents" class="kpi-value">—</div>
+        </div>
+      </div>
+      <div id="qualityReasons" class="quality-reasons"></div>
+      <div class="actions compact">
+        <a id="downloadQuality" class="button" href="#" download disabled>下载抽取诊断</a>
+        <a id="downloadValidationReport" class="button" href="#" download disabled>下载校验报告</a>
+        <a id="downloadPairDiagnostics" class="button" href="#" download disabled>下载配对诊断</a>
+      </div>
+    </div>
   </section>
 
-  <section class="card">
-    <h2>④ 角色对配对（数据集）</h2>
-    <div class="grid two">
-      <div>
+  <section class="card" data-step-panel="pairs">
+    <div class="section-head">
+      <h2><span class="section-num">04</span>角色对配对（数据集）</h2>
+      <span class="section-status">样本筛选</span>
+    </div>
+    <div class="grid two form-grid">
+      <div class="field">
         <label>选择角色对 <span class="muted">(留空即选择全部有序对；支持通配 ALL/全部)</span></label>
         <input id="pairs" placeholder="如：张三,李四 | ALL, 李四 | 李四, ALL（多个用 | 分隔）">
       </div>
-      <div>
+      <div class="field">
         <label>最小置信度</label>
         <input id="minConfidence" type="number" min="0" max="1" step="0.05" value="0.80">
       </div>
-      <div>
+      <div class="field">
         <label>严格模式</label>
         <select id="strict">
           <option value="true" selected>开启</option>
           <option value="false">关闭</option>
         </select>
       </div>
-      <div>
+      <div class="field">
         <label>必须包含置信度</label>
         <select id="requireConf">
           <option value="false" selected>否</option>
@@ -180,39 +254,42 @@
     </div>
   </section>
 
-  <section class="card">
-    <h2>⑤ 导出 ChatML 数据集</h2>
-    <div class="grid three">
-      <div>
+  <section class="card" data-step-panel="chatml">
+    <div class="section-head">
+      <h2><span class="section-num">05</span>导出 ChatML 数据集</h2>
+      <span class="section-status">训练格式</span>
+    </div>
+    <div class="grid three form-grid">
+      <div class="field">
         <label>模式</label>
         <select id="mode">
           <option value="pair" selected>pair（每条 1 轮）</option>
           <option value="stitch">stitch（同 chunk 拼接）</option>
         </select>
       </div>
-      <div>
+      <div class="field">
         <label>最大轮数</label>
         <input id="maxTurns" type="number" min="1" value="4">
       </div>
-      <div>
+      <div class="field">
         <label>最小置信度（可选）</label>
         <input id="chatmlMinConf" type="number" min="0" max="1" step="0.05" placeholder="不过滤">
       </div>
-      <div>
+      <div class="field">
         <label>去重</label>
         <select id="dedupe">
           <option value="false" selected>否</option>
           <option value="true">是</option>
         </select>
       </div>
-      <div>
+      <div class="field">
         <label>反转角色</label>
         <select id="reverse">
           <option value="false" selected>否</option>
           <option value="true">是</option>
         </select>
       </div>
-      <div>
+      <div class="field">
         <label>系统消息（可 @file）</label>
         <input id="systemText" placeholder="如：@system.txt 或 直接写文本">
       </div>
@@ -223,7 +300,10 @@
     </div>
   </section>
 
-  <footer class="muted center">Text2Dialog v0.1.0 · MIT · <a href="https://github.com/zw-zhtlab/Text2Dialog">GitHub</a></footer>
+    </div>
+  </div>
+
+  <footer class="site-footer muted center">Text2Dialog v0.1.0 · MIT · <a href="https://github.com/zw-zhtlab/Text2Dialog">GitHub</a></footer>
 </main>
 
 <script>
@@ -272,32 +352,5 @@
 
 <script src="./static/app.js"></script>
 
-<script>
-  (function () {
-    document.addEventListener('DOMContentLoaded', function () {
-      const cancelBtn = document.getElementById('cancel');
-      const statusEl = document.getElementById('status');
-      if (!cancelBtn || !statusEl) return;
-
-      // 当点击“取消”后，显示“已取消”
-      cancelBtn.addEventListener('click', function () {
-        // 让 app.js 的取消逻辑先运行，避免相互覆盖
-        setTimeout(function () {
-          statusEl.textContent = '已取消';
-        }, 0);
-      });
-      const runBtn = document.getElementById('run');
-      if (runBtn) {
-        runBtn.addEventListener('click', function () {
-          setTimeout(function () {
-            if (statusEl.textContent === '已取消') {
-              statusEl.textContent = '';
-            }
-          }, 0);
-        });
-      }
-    });
-  })();
-</script>
 </body>
 </html>

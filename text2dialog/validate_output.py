@@ -6,6 +6,8 @@ validate_output.py - 检查 dialogue_chain JSONL 格式
 import json
 import math
 import sys
+import contextlib
+import io
 from typing import Any, Dict, List
 
 ChunkEntry = Dict[str, Any]
@@ -183,6 +185,22 @@ def validate(path: str) -> int:
 
     print('通过' if ok else '失败', file=sys.stderr)
     return 0 if ok else 1
+
+
+def validate_with_report(path: str, max_messages: int = 200) -> Dict[str, Any]:
+    """运行校验并返回可给 API/前端消费的结构化报告。"""
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        code = validate(path)
+    lines = [line for line in buf.getvalue().splitlines() if line.strip()]
+    messages = [line for line in lines if line not in {"通过", "失败"}]
+    return {
+        "ok": code == 0,
+        "status": "通过" if code == 0 else "失败",
+        "error_count": len(messages),
+        "messages": messages[:max_messages],
+        "truncated": len(messages) > max_messages,
+    }
 
 
 if __name__ == "__main__":

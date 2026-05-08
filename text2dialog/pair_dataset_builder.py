@@ -69,6 +69,13 @@ def _norm_role(s: str) -> str:
     return (s or "").strip()
 
 
+def _preview_text(value: Any, limit: int = 80) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
 def _safe_pair_name(src: str, tgt: str) -> str:
     """把角色对转换为安全的文件名片段。"""
     def safe(s: str) -> str:
@@ -307,7 +314,8 @@ def extract_pairs(jsonl_path: Path,
                   min_reply_chars: int = 1,
                   max_src_chars: Optional[int] = None,
                   max_reply_chars: Optional[int] = None,
-                  deny_patterns: Optional[List[str]] = None
+                  deny_patterns: Optional[List[str]] = None,
+                  diagnostics: Optional[List[Dict[str, Any]]] = None
                   ) -> Dict[Tuple[str, str], List[PairSample]]:
     """
     从 JSONL 抽取指定**有序角色对**的数据集。
@@ -340,6 +348,37 @@ def extract_pairs(jsonl_path: Path,
 
     buckets: Dict[Tuple[str, str], List[PairSample]] = defaultdict(list)
 
+    def _diag(action: str, reason: str, cur: Optional[Utterance] = None,
+              src: Optional[Utterance] = None, pair: Optional[Tuple[str, str]] = None,
+              confidence: Optional[float] = None) -> None:
+        if diagnostics is None:
+            return
+        diagnostics.append({
+            "stage": "pair",
+            "action": action,
+            "reason": reason,
+            "pair": {"from": pair[0], "to": pair[1]} if pair else None,
+            "confidence": confidence,
+            "source": (
+                {
+                    "chunk_id": src.key.chunk_id,
+                    "dialogue_index": src.key.index,
+                    "role": src.role,
+                    "text_preview": _preview_text(src.text),
+                }
+                if src else None
+            ),
+            "reply": (
+                {
+                    "chunk_id": cur.key.chunk_id,
+                    "dialogue_index": cur.key.index,
+                    "role": cur.role,
+                    "text_preview": _preview_text(cur.text),
+                }
+                if cur else None
+            ),
+        })
+
     for line_no, rec in records:
         cid = rec.get("chunk_id", None)
         di = rec.get("dialogue_index", None)
@@ -349,15 +388,18 @@ def extract_pairs(jsonl_path: Path,
 
         cur = idx.get(UtteranceKey(int(cid), int(di)))
         if cur is None:
+            _diag("discarded", "index_record_missing")
             continue
 
         resolved = _resolve_reply_target(cur, idx)
         if not resolved:
+            _diag("discarded", "reply_absent_or_unresolved", cur=cur)
             continue
         src, conf, target_role_field = resolved
 
         # 自回复或同条异常，跳过
         if src.key.chunk_id == cur.key.chunk_id and src.key.index == cur.key.index:
+            _diag("discarded", "self_reply", cur=cur, src=src, confidence=conf)
             continue
 
         src_role = _norm_role(src.role)
@@ -366,6 +408,7 @@ def extract_pairs(jsonl_path: Path,
         # 若要求一致性，且 target_role 存在但与解析到的 src.role 不同，则丢弃
         if drop_if_target_role_inconsistent and target_role_field is not None:
             if _norm_role(target_role_field) != src_role:
+                _diag("discarded", "target_role_inconsistent", cur=cur, src=src, confidence=conf)
                 continue
 
         # 方向匹配
@@ -383,21 +426,27 @@ def extract_pairs(jsonl_path: Path,
                 matched = True
 
         if not matched:
+            _diag("discarded", "pair_not_requested", cur=cur, src=src, pair=pair, confidence=conf)
             continue
 
         # 置信度过滤（缺失置信度也视为不通过，以避免污染）
         if require_confidence and conf is None:
+            _diag("discarded", "confidence_missing", cur=cur, src=src, pair=pair, confidence=conf)
             continue
         if min_confidence is not None:
             if conf is None:
+                _diag("discarded", "confidence_missing", cur=cur, src=src, pair=pair, confidence=conf)
                 continue
             if float(conf) < float(min_confidence):
+                _diag("discarded", "confidence_below_threshold", cur=cur, src=src, pair=pair, confidence=conf)
                 continue
 
         # 文本合法性过滤
         if not _is_text_legal(src.text, min_chars=min_src_chars, max_chars=max_src_chars, deny_res=deny_res):
+            _diag("discarded", "source_text_filtered", cur=cur, src=src, pair=pair, confidence=conf)
             continue
         if not _is_text_legal(cur.text, min_chars=min_reply_chars, max_chars=max_reply_chars, deny_res=deny_res):
+            _diag("discarded", "reply_text_filtered", cur=cur, src=src, pair=pair, confidence=conf)
             continue
 
         sample = PairSample(
@@ -413,6 +462,7 @@ def extract_pairs(jsonl_path: Path,
             confidence=(float(conf) if conf is not None else None),
         )
         buckets[pair].append(sample)
+        _diag("accepted", "pair_accepted", cur=cur, src=src, pair=pair, confidence=sample.confidence)
 
     return buckets
 
@@ -547,6 +597,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     misc = ap.add_argument_group("其他")
     misc.add_argument("--list-roles", action="store_true", help="仅统计并输出角色列表与频次，不做抽取")
     misc.add_argument("--validate-path", default=None, help="可选：validate_output.py 的路径；提供则先做校验")
+    misc.add_argument("--diagnostics-out", default=None, help="可选：写出配对诊断 JSONL，解释样本保留/丢弃原因")
 
     args = ap.parse_args(argv)
 
@@ -625,6 +676,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     drop_if_target_role_inconsistent = bool(args.strict)
 
     # 抽取
+    diagnostics: Optional[List[Dict[str, Any]]] = [] if args.diagnostics_out else None
     buckets = extract_pairs(
         jsonl_path=jsonl_path,
         role_pairs=role_pairs,
@@ -637,6 +689,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_src_chars=args.max_src_chars,
         max_reply_chars=args.max_reply_chars,
         deny_patterns=args.deny_pattern,
+        diagnostics=diagnostics,
     )
 
     # 写文件
@@ -651,6 +704,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     for pair, L in buckets.items():
         print(f"  {pair[0]} -> {pair[1]}: {len(L)} 条")
     print(f"  合计样本: {sum(len(v) for v in buckets.values())}")
+
+    if args.diagnostics_out and diagnostics is not None:
+        diag_path = Path(args.diagnostics_out)
+        diag_path.parent.mkdir(parents=True, exist_ok=True)
+        with diag_path.open("w", encoding="utf-8") as f:
+            for event in diagnostics:
+                json.dump(event, f, ensure_ascii=False)
+                f.write("\n")
+        by_reason = Counter(str(e.get("reason", "")) for e in diagnostics)
+        print(f"  诊断事件: {len(diagnostics)} 条 -> {diag_path}")
+        for reason, count in by_reason.most_common(8):
+            print(f"    {reason}: {count}")
 
     return 0
 

@@ -1,6 +1,19 @@
 (() => {
   const $ = (sel) => document.querySelector(sel);
-  const api = (p, opt = {}) => fetch(p, opt).then(r => r.json()).catch(() => ({}));
+  const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+  const api = async (p, opt = {}) => {
+    try {
+      const r = await fetch(p, opt);
+      const text = await r.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!r.ok) {
+        return { ...data, ok: false, http_status: r.status };
+      }
+      return data;
+    } catch (err) {
+      return { ok: false, detail: err && err.message ? err.message : '请求失败' };
+    }
+  };
 
   let jobId = null;
   let defaults = null;
@@ -13,6 +26,61 @@
     $('#buildPairs').disabled = !enable;
     $('#buildChatML').disabled = true; // 只有 pairs 完成后才开启
     $('#downloadExtract').toggleAttribute('disabled', !enable);
+    $('#downloadQuality').toggleAttribute('disabled', !enable);
+  }
+  function showToast(text, type = 'info') {
+    const toast = $('#toast');
+    if (!toast) return;
+    toast.textContent = text || '';
+    toast.className = `toast ${type}`;
+    toast.hidden = !text;
+    if (text) {
+      clearTimeout(showToast._timer);
+      showToast._timer = setTimeout(() => { toast.hidden = true; }, 4200);
+    }
+  }
+  function setStatus(text, isError = false) {
+    const el = $('#status');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('error', Boolean(isError));
+  }
+  function setWorkflowState(states = {}) {
+    let activeStep = '';
+    $$('.workflow-step').forEach(step => {
+      const state = states[step.dataset.step] || '';
+      if (state === 'active') activeStep = step.dataset.step;
+      step.classList.toggle('active', state === 'active');
+      step.classList.toggle('done', state === 'done');
+      step.classList.toggle('error', state === 'error');
+    });
+    $$('[data-step-panel]').forEach(panel => {
+      const state = states[panel.dataset.stepPanel] || '';
+      panel.classList.toggle('active', state === 'active');
+      panel.classList.toggle('done', state === 'done');
+      panel.classList.toggle('error', state === 'error');
+    });
+    document.body.dataset.workflowStep = activeStep;
+  }
+  function resetWorkflow() {
+    setWorkflowState({ upload: 'active' });
+  }
+  function resetResultUI() {
+    ['#statsCard', '#qualityCard'].forEach(sel => {
+      const el = $(sel);
+      if (el) el.style.display = 'none';
+    });
+    ['#preview', '#validateLog', '#roleBars', '#qualityReasons'].forEach(sel => {
+      const el = $(sel);
+      if (el) el.textContent = '';
+    });
+    ['#downloadPairs', '#downloadChatML', '#downloadValidationReport', '#downloadPairDiagnostics'].forEach(sel => {
+      const el = $(sel);
+      if (el) {
+        el.href = '#';
+        el.toggleAttribute('disabled', true);
+      }
+    });
   }
   function clearPollTimer() {
     if (pollTimer) {
@@ -55,6 +123,7 @@
   }
 
   function setControlButtonsByStatus(status) {
+    document.body.dataset.jobStatus = status || 'idle';
     // 缺省：全部禁用
     const disableAll = () => {
       btnPause.disabled = true;
@@ -104,12 +173,14 @@
     }
     // 初始禁用控制按钮
     setControlButtonsByStatus('idle');
+    resetWorkflow();
   }
 
   // -------- 上传 --------
   const dz = $('#dropzone');
   const file = $('#file');
   const pick = $('#pick');
+  dz.addEventListener('dragenter', e => { e.preventDefault(); dz.classList.add('dragover'); });
   dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
   dz.addEventListener('dragleave', () => { dz.classList.remove('dragover'); });
   dz.addEventListener('drop', async e => {
@@ -120,16 +191,35 @@
   file.addEventListener('change', async () => { if (file.files.length) await upload(file.files[0]); });
 
   async function upload(f) {
-    const fd = new FormData();
-    fd.append('file', f);
-    const resp = await fetch('/api/jobs/create', { method: 'POST', body: fd }).then(r => r.json());
-    jobId = resp.job_id;
-    $('#uploadResult').textContent = `已上传：${f.name}，Job ID = ${jobId}`;
-    enableRun(true);
-    enableAfterExtract(false);
-    clearPollTimer();
-    resetProgressUI();
-    setControlButtonsByStatus('idle');
+    dz.classList.add('is-busy');
+    dz.classList.remove('has-file');
+    $('#uploadResult').textContent = `正在上传：${f.name}…`;
+    try {
+      const fd = new FormData();
+      fd.append('file', f);
+      const resp = await api('/api/jobs/create', { method: 'POST', body: fd });
+      if (!resp.job_id) {
+        $('#uploadResult').textContent = `上传失败：${resp.detail || '服务端未返回 Job ID'}`;
+        showToast('上传失败', 'error');
+        setWorkflowState({ upload: 'error' });
+        enableRun(false);
+        return;
+      }
+      jobId = resp.job_id;
+      dz.classList.add('has-file');
+      $('#uploadResult').textContent = `已上传：${f.name}，Job ID = ${jobId}`;
+      $('#uploadState').textContent = f.name;
+      showToast('文本已上传', 'success');
+      enableRun(true);
+      enableAfterExtract(false);
+      clearPollTimer();
+      resetResultUI();
+      resetProgressUI();
+      setControlButtonsByStatus('idle');
+      setWorkflowState({ upload: 'done', extract: 'active' });
+    } finally {
+      dz.classList.remove('is-busy');
+    }
   }
 
   // -------- 启动提取 --------
@@ -140,6 +230,7 @@
     enableAfterExtract(false);
     setProgressIndeterminate('启动中…');
     setControlButtonsByStatus('running'); // 预设按钮状态
+    setWorkflowState({ upload: 'done', extract: 'active' });
 
     const body = {
       platform: $('#platform').value || null,
@@ -162,6 +253,16 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
+
+    if (!startResp.ok) {
+      const detail = startResp.detail || startResp.error || `HTTP ${startResp.http_status || ''}`;
+      setStatus(`启动失败：${detail}`, true);
+      showToast('启动失败', 'error');
+      setWorkflowState({ upload: 'done', extract: 'error' });
+      enableRun(true);
+      setControlButtonsByStatus('failed');
+      return;
+    }
 
     // 显示 PID（若后端返回）
     if (startResp && typeof startResp.pid === 'number') {
@@ -203,14 +304,14 @@
     }
     const statusEl = $('#status');
     const etaEl = $('#eta');
-    if (statusEl) statusEl.textContent = '';
+    setStatus('');
     if (etaEl) etaEl.textContent = '';
   }
 
   function setProgressIndeterminate(text) {
     $('#bar').style.display = 'block';
     $('#bar').removeAttribute('value'); // 不确定态
-    $('#status').textContent = text || '准备中…';
+    setStatus(text || '准备中…');
     const etaEl = $('#eta'); if (etaEl) etaEl.textContent = '';
   }
 
@@ -223,7 +324,7 @@
     parts.push(`${processed} / ${total}（${pctText}）`);
     if (stageText) parts.push(stageText);
     if (message) parts.push(message);
-    $('#status').textContent = parts.join(' · ');
+    setStatus(parts.join(' · '));
 
     const etaEl = $('#eta');
     if (etaEl) {
@@ -290,7 +391,9 @@
         return;
       }
       if (isCancelled) {
-        $('#status').textContent = stageText || '已取消';
+      setStatus(stageText || '已取消');
+      showToast('作业已取消', 'error');
+        setWorkflowState({ upload: 'done', extract: 'error' });
         enableRun(true);
         enableAfterExtract(false);
         clearPollTimer();
@@ -308,12 +411,13 @@
       }
 
       // 收敛条件：失败优先于成功，避免 failed + processed>=total 被误判为成功
-      const reachedTotal = Number.isFinite(total) && total > 0 && processed >= total;
       const isFailed = (status === 'failed' || stage === 'failed');
-      const isSucceeded = (status === 'succeeded' || stage === 'done' || reachedTotal) && !isFailed && !isCancelled;
+      const isSucceeded = (status === 'succeeded' || stage === 'done') && !isFailed && !isCancelled;
 
       if (isFailed) {
-        $('#status').textContent = '失败：' + (message || '');
+        setStatus('失败：' + (message || ''), true);
+        showToast('抽取失败', 'error');
+        setWorkflowState({ upload: 'done', extract: 'error' });
         enableAfterExtract(false);
         enableRun(true);
         setControlButtonsByStatus('failed');
@@ -323,7 +427,9 @@
 
       if (isSucceeded) {
         // 成功收尾
-        $('#status').textContent = '完成';
+        setStatus('完成');
+        showToast('抽取完成', 'success');
+        setWorkflowState({ upload: 'done', extract: 'done', validate: 'active' });
         enableAfterExtract(true);
         enableRun(true);
         setControlButtonsByStatus('succeeded');
@@ -383,6 +489,7 @@
     try {
       const job = await api(`/api/jobs/${jobId}`);
       if (job && job.stats) renderStats(job.stats);
+      if (job) renderQuality(job);
     } catch (e) {
       console.warn('加载统计失败：', e);
     }
@@ -432,6 +539,58 @@
     }
   }
 
+  function topReasons(...summaries) {
+    const merged = {};
+    summaries.forEach(summary => {
+      const reasons = summary && summary.by_reason ? summary.by_reason : {};
+      Object.entries(reasons).forEach(([reason, count]) => {
+        merged[reason] = (merged[reason] || 0) + Number(count || 0);
+      });
+    });
+    return Object.entries(merged).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  }
+
+  function setDownload(id, href, enabled) {
+    const el = $(id);
+    if (!el) return;
+    if (href) el.href = href;
+    el.toggleAttribute('disabled', !enabled);
+  }
+
+  function renderQuality(job) {
+    const card = $('#qualityCard');
+    if (!card) return;
+    const extraction = job.quality_summary || {};
+    const validation = job.validation_summary || {};
+    const pair = job.pair_quality_summary || {};
+    const hasQuality = Boolean(
+      extraction.events || validation.error_count || pair.events ||
+      (job.artifacts && (job.artifacts.quality_report || job.artifacts.validation_report || job.artifacts.pair_diagnostics))
+    );
+    if (!hasQuality) return;
+
+    card.style.display = 'block';
+    $('#qualityEvents').textContent = nf.format(extraction.events || 0);
+    $('#validationIssues').textContent = nf.format(validation.error_count || 0);
+    $('#pairQualityEvents').textContent = nf.format(pair.events || 0);
+
+    const reasons = topReasons(extraction, pair);
+    const reasonsEl = $('#qualityReasons');
+    if (reasonsEl) {
+      reasonsEl.innerHTML = reasons.map(([reason, count]) => `
+        <div class="quality-reason">
+          <div class="quality-reason-name" title="${escapeHtml(reason)}">${escapeHtml(reason)}</div>
+          <div class="quality-reason-count">${nf.format(count)}</div>
+        </div>
+      `).join('');
+    }
+
+    const artifacts = job.artifacts || {};
+    setDownload('#downloadQuality', `/api/jobs/${jobId}/download?which=quality_report`, Boolean(artifacts.quality_report));
+    setDownload('#downloadValidationReport', `/api/jobs/${jobId}/download?which=validation_report`, Boolean(artifacts.validation_report));
+    setDownload('#downloadPairDiagnostics', `/api/jobs/${jobId}/download?which=pair_diagnostics`, Boolean(artifacts.pair_diagnostics));
+  }
+
   // -------- 校验 --------
   $('#validate').addEventListener('click', async () => {
     const res = await api('/api/validate', {
@@ -439,8 +598,19 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ job_id: jobId })
     });
-    if (res.ok) $('#validateLog').textContent = '✅ 校验通过\n' + (res.log || '');
-    else $('#validateLog').textContent = '⚠️ 校验未通过，请检查日志\n' + (res.log || '');
+    if (res.ok) {
+      $('#validateLog').textContent = '校验通过\n' + (res.log || '');
+      showToast('校验通过', 'success');
+      const job = await api(`/api/jobs/${jobId}`);
+      renderQuality(job);
+      setWorkflowState({ upload: 'done', extract: 'done', validate: 'done', pairs: 'active' });
+    } else {
+      $('#validateLog').textContent = '校验未通过，请检查日志\n' + (res.log || res.detail || '');
+      showToast('校验未通过', 'error');
+      const job = await api(`/api/jobs/${jobId}`);
+      renderQuality(job);
+      setWorkflowState({ upload: 'done', extract: 'done', validate: 'error' });
+    }
   });
 
   // -------- 生成 Pair 数据集 --------
@@ -464,8 +634,13 @@
       $('#downloadPairs').href = `/api/jobs/${jobId}/download?which=pairs_zip`;
       $('#downloadPairs').removeAttribute('disabled');
       $('#buildChatML').disabled = false; // 允许导出 ChatML
+      const job = await api(`/api/jobs/${jobId}`);
+      renderQuality(job);
+      setWorkflowState({ upload: 'done', extract: 'done', validate: 'done', pairs: 'done', chatml: 'active' });
     } else {
-      alert('生成失败：' + (res.log || ''));
+      setWorkflowState({ upload: 'done', extract: 'done', pairs: 'error' });
+      showToast('Pair 数据集生成失败', 'error');
+      alert('生成失败：' + (res.log || res.detail || ''));
     }
   });
 
@@ -488,8 +663,12 @@
     if (res.ok) {
       $('#downloadChatML').href = `/api/jobs/${jobId}/download?which=chatml`;
       $('#downloadChatML').removeAttribute('disabled');
+      showToast('ChatML 已生成', 'success');
+      setWorkflowState({ upload: 'done', extract: 'done', validate: 'done', pairs: 'done', chatml: 'done' });
     } else {
-      alert('导出失败：' + (res.log || ''));
+      setWorkflowState({ upload: 'done', extract: 'done', pairs: 'done', chatml: 'error' });
+      showToast('ChatML 导出失败', 'error');
+      alert('导出失败：' + (res.log || res.detail || ''));
     }
   });
 
