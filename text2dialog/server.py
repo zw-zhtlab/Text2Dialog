@@ -36,8 +36,8 @@ from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(APP_ROOT, "static")
-JOBS_DIR = os.path.join(APP_ROOT, "jobs")
+STATIC_DIR = os.path.abspath(os.getenv("TEXT2DIALOG_STATIC_DIR") or os.path.join(APP_ROOT, "static"))
+JOBS_DIR = os.path.abspath(os.getenv("TEXT2DIALOG_JOBS_DIR") or os.path.join(APP_ROOT, "jobs"))
 os.makedirs(JOBS_DIR, exist_ok=True)
 
 _TRUE_SET = {"1", "true", "yes", "on"}
@@ -80,11 +80,18 @@ def _import_project_modules():
     if all([DialogueChain, Config, ModelPlatform, validator, pair_builder, p2c, CancelledErrorCls]):
         return
     try:
-        from dialogue_chain import DialogueChain as _DC, CancelledError as _CE  # 新增 CancelledError
-        from config import Config as _CFG, ModelPlatform as _MP
-        import validate_output as _V
-        import pair_dataset_builder as _PB
-        import pair_to_chatml as _P2C
+        try:
+            from .dialogue_chain import DialogueChain as _DC, CancelledError as _CE
+            from .config import Config as _CFG, ModelPlatform as _MP
+            from . import validate_output as _V
+            from . import pair_dataset_builder as _PB
+            from . import pair_to_chatml as _P2C
+        except ImportError:
+            from dialogue_chain import DialogueChain as _DC, CancelledError as _CE
+            from config import Config as _CFG, ModelPlatform as _MP
+            import validate_output as _V
+            import pair_dataset_builder as _PB
+            import pair_to_chatml as _P2C
         DialogueChain, Config, ModelPlatform = _DC, _CFG, _MP
         validator, pair_builder, p2c = _V, _PB, _P2C
         CancelledErrorCls = _CE
@@ -411,6 +418,48 @@ def api_defaults():
         "CACHE_DIR": Config.CACHE_DIR,
     }
     return {"platforms": platforms, "config": cfg, "schema_default": Config.DEFAULT_SCHEMA}
+
+@app.get("/api/capabilities")
+def api_capabilities():
+    """Return a compact integration contract for embedding systems."""
+    _import_project_modules()
+    return {
+        "name": "Text2Dialog",
+        "version": app.version,
+        "job_id_pattern": _JOB_ID_RE.pattern,
+        "paths": {
+            "jobs_dir": JOBS_DIR,
+            "static_dir": STATIC_DIR,
+        },
+        "features": {
+            "remote_access": ALLOW_REMOTE,
+            "external_paths": ALLOW_EXTERNAL_PATHS,
+            "proxy_headers": TRUST_PROXY_HEADERS,
+            "requires_remote_token": bool(REMOTE_API_TOKEN),
+            "pause_resume_cancel": True,
+            "quality_reports": True,
+        },
+        "artifacts": [
+            "extraction",
+            "validated",
+            "quality_report",
+            "validation_report",
+            "pairs_zip",
+            "pair_diagnostics",
+            "chatml",
+        ],
+        "platforms": ModelPlatform.list_platforms(),
+        "endpoints": {
+            "create_job": "POST /api/jobs/create",
+            "start_extract": "POST /api/jobs/{job_id}/extract",
+            "progress": "GET /api/jobs/{job_id}/progress",
+            "control": "POST /api/jobs/{job_id}/control",
+            "validate": "POST /api/validate",
+            "pairs": "POST /api/pairs",
+            "chatml": "POST /api/chatml",
+            "download": "GET /api/jobs/{job_id}/download?which={artifact}",
+        },
+    }
 
 @app.post("/api/jobs/create")
 async def create_job(file: UploadFile = File(...)):

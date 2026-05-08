@@ -29,20 +29,39 @@ from tqdm import tqdm
 from openai import OpenAI
 from dotenv import load_dotenv, find_dotenv
 
-from config import Config
+try:
+    from .config import Config
+except ImportError:  # pragma: no cover - script execution fallback
+    from config import Config
 
 # 加载 .env 变量（如果存在）
 load_dotenv(find_dotenv())
 
 # ========== 日志设置 ==========
-logging.basicConfig(
-    level=getattr(logging, str(getattr(Config, "LOG_LEVEL", "INFO")).upper()),
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(getattr(Config, "LOG_FILE", "dialogue_chain.log"), encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
+def _configure_logging() -> None:
+    """
+    Configure default logging only when the host application has not already
+    done so. This keeps library-style imports from overriding a larger
+    system's logging setup.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return
+
+    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    if os.getenv("TEXT2DIALOG_DISABLE_FILE_LOG", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        log_file = getattr(Config, "LOG_FILE", "dialogue_chain.log")
+        if log_file:
+            handlers.insert(0, logging.FileHandler(log_file, encoding="utf-8"))
+
+    logging.basicConfig(
+        level=getattr(logging, str(getattr(Config, "LOG_LEVEL", "INFO")).upper()),
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+    )
+
+
+_configure_logging()
 logger = logging.getLogger(__name__)
 
 

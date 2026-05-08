@@ -156,6 +156,39 @@ for fut in as_completed(future_to_item):
 6) **数据模型演进**：扩展抽取字段时，先在 schema（`DEFAULT_SCHEMA` 或自定义）声明，再调整 `_parse_and_validate_response`、验证器和下游转换；保持向后兼容老 JSONL。  
 7) **配置扩展**：在 `Config` 增加字段与默认值，更新 `_apply_overrides` 映射，并在 `/api/defaults` 返回给前端。
 
+### 5.1 推荐的嵌入方式
+- **作为库调用**：优先使用 `text2dialog.pipeline`，它把原先偏 CLI 的模块包装成 dataclass API：`ExtractOptions`、`PairBuildOptions`、`ChatMLOptions`、`run_extraction()`、`validate_extraction()`、`build_pair_dataset()`、`convert_pairs_to_chatml()`、`run_dataset_pipeline()`。
+- **作为服务嵌入**：更大的 FastAPI 系统可以 `from text2dialog.server import app as text2dialog_app` 后 `app.mount("/text2dialog", text2dialog_app)`。如需外置产物目录，启动前设置 `TEXT2DIALOG_JOBS_DIR`。
+- **作为远程子服务**：启用 `TEXT2DIALOG_ALLOW_REMOTE=1` 时必须设置 `TEXT2DIALOG_API_TOKEN`，调用方使用 `Authorization: Bearer <token>` 或 `X-API-Key`。
+- **服务发现**：集成方可调用 `GET /api/capabilities` 获取版本、artifact 名称、能力开关、endpoint map 与 jobs/static 目录，避免硬编码。
+
+### 5.2 程序化流水线示例
+```python
+from text2dialog import ExtractOptions, PairBuildOptions, ChatMLOptions, run_dataset_pipeline
+
+result = run_dataset_pipeline(
+    input_path="input.txt",
+    work_dir="jobs/embed-demo",
+    extract_options=ExtractOptions(
+        platform="siliconflow",
+        model_name="deepseek-ai/DeepSeek-V4-Flash",
+        concurrent=True,
+        threads=4,
+        cache_dir="jobs/embed-demo/.cache",
+    ),
+    pair_options=PairBuildOptions(all_ordered_pairs=True, min_confidence=0.8),
+    chatml_options=ChatMLOptions(mode="pair", dedupe=True),
+)
+
+print(result.extraction.extraction_path)
+print(result.chatml.output_path)
+```
+
+注意事项：
+- `ExtractOptions.api_key` 支持显式传入，但 `repr=False`，避免调试打印时泄漏；仍不要写入日志或提交记录。
+- 程序化抽取会临时修改当前进程的环境变量与 `Config` 类属性；不同凭证/不同模型并发运行时建议用多进程隔离。
+- 如果宿主系统已经配置 Python logging，`dialogue_chain.py` 不会再覆盖 root logger；可用 `TEXT2DIALOG_DISABLE_FILE_LOG=1` 禁用默认文件日志。
+
 ---
 
 ## 6. 调试与性能调优

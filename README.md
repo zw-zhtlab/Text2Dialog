@@ -33,6 +33,8 @@ Text2Dialog/
 ├─ launcher.py                 # Tk GUI：配置环境、管理 FastAPI、打开前端/文档
 ├─ run_server.(sh|bat)         # 一键启动 uvicorn 服务
 └─ text2dialog/
+   ├─ __init__.py              # 包级公共入口（惰性导入，便于二次开发）
+   ├─ pipeline.py              # 程序化流水线封装：抽取/校验/配对/ChatML
    ├─ server.py                # FastAPI：作业管理、抽取/校验/配对/导出、静态前端
    ├─ dialogue_chain.py        # 核心对话抽取：分块/并发/重试/校验/进度/续跑/控制
    ├─ config.py                # 配置与平台抽象（默认模型、提示词模板、schema 等）
@@ -302,6 +304,67 @@ curl -X POST http://localhost:8000/api/jobs/<job_id>/extract \
 # 3) 轮询进度
 curl http://localhost:8000/api/jobs/<job_id>/progress
 ```
+
+---
+
+## 🧩 二次开发与系统嵌入
+
+### 1) 作为 Python 包调用
+`text2dialog` 提供轻量的包级入口与程序化流水线封装，可在更大的调度系统中直接调用：
+
+```python
+from text2dialog import (
+    ExtractOptions,
+    PairBuildOptions,
+    ChatMLOptions,
+    run_dataset_pipeline,
+)
+
+result = run_dataset_pipeline(
+    "input.txt",
+    "workdir/job-001",
+    extract_options=ExtractOptions(
+        platform="siliconflow",
+        model_name="deepseek-ai/DeepSeek-V4-Flash",
+        concurrent=True,
+        threads=4,
+    ),
+    pair_options=PairBuildOptions(all_ordered_pairs=True, min_confidence=0.8),
+    chatml_options=ChatMLOptions(mode="pair", dedupe=True),
+)
+
+print(result.extraction.extraction_path)
+print(result.chatml.output_path)
+```
+
+也可以分阶段调用：
+- `run_extraction(input_path, output_path, ExtractOptions(...))`
+- `validate_extraction(path)`
+- `build_pair_dataset(path, PairBuildOptions(...))`
+- `convert_pairs_to_chatml(inputs, output_path, ChatMLOptions(...))`
+
+> 注意：程序化抽取会临时覆写进程内环境变量和 `Config` 类属性；如果同一 Python 进程内要并发跑多套不同 LLM 凭证，建议用多进程隔离，或改走 REST API。
+
+### 2) 作为 FastAPI 子系统嵌入
+更大的 Web 系统可直接复用 FastAPI app：
+
+```python
+from fastapi import FastAPI
+from text2dialog.server import app as text2dialog_app
+
+app = FastAPI()
+app.mount("/text2dialog", text2dialog_app)
+```
+
+集成发现端点：
+- `GET /api/capabilities`：返回版本、支持平台、artifact 名称、关键能力开关和 endpoint map。
+- `GET /api/defaults`：返回运行参数默认值、平台描述和默认 schema。
+
+可通过环境变量调整嵌入行为：
+- `TEXT2DIALOG_JOBS_DIR=/path/to/jobs`：将作业与产物目录移出源码目录。
+- `TEXT2DIALOG_STATIC_DIR=/path/to/static`：自定义静态前端目录。
+- `TEXT2DIALOG_DISABLE_FILE_LOG=1`：作为库导入时不创建默认文件日志。
+- `TEXT2DIALOG_ALLOW_REMOTE=1` + `TEXT2DIALOG_API_TOKEN=...`：允许远程访问并启用 Bearer/X-API-Key 保护。
 
 ---
 
