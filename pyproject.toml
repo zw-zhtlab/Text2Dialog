@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=77,<82"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "text2dialog"
+dynamic = ["version"]
+description = "Extract structured dialogue and training datasets from long-form text."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Text2Dialog contributors" }]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "openai>=1.30,<3",
+  "tiktoken>=0.7,<1",
+  "tqdm>=4.66,<5",
+  "python-dotenv>=1.0,<2",
+  "fastapi>=0.111,<1",
+  "uvicorn>=0.30,<1",
+  "pydantic>=2.7,<3",
+  "python-multipart>=0.0.9,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "ruff>=0.12,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/zw-zhtlab/Text2Dialog"
+Repository = "https://github.com/zw-zhtlab/Text2Dialog"
+
+[project.scripts]
+text2dialog = "text2dialog.cli:extract_main"
+text2dialog-server = "text2dialog.cli:server_main"
+text2dialog-validate = "text2dialog.cli:validate_main"
+text2dialog-pairs = "text2dialog.cli:pairs_main"
+text2dialog-chatml = "text2dialog.cli:chatml_main"
+
+[tool.setuptools.packages.find]
+include = ["text2dialog*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "text2dialog.__version__" }
+
+[tool.setuptools.package-data]
+text2dialog = ["env.example", "static/*.html", "static/*.css", "static/*.js"]
+
+[tool.ruff]
+target-version = "py310"

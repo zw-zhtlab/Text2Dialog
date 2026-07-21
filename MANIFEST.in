@@ -1,0 +1,10 @@
+# Internal verification assets are intentionally local-only.
+prune tests
+prune tools
+prune .local_tests
+prune .arbor
+
+global-exclude test_*.py
+global-exclude *_test.py
+global-exclude *.py[cod]
+global-exclude __pycache__

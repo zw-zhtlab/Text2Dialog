@@ -7,7 +7,7 @@
 > Automatically extract long-form text (e.g., novels, screenplays, nonfiction) into structured character dialogues with reply links, and complete: quality validation → role pairing → ChatML dataset export in one click. Provides a command line tool, FastAPI service, and a visual frontend (with a one‑click launcher).
 
 <p align="center">
-  <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-blue" />
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10--3.13-blue" />
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.110%2B-009688" />
   <img alt="OpenAI SDK" src="https://img.shields.io/badge/SDK-openai%20compatible-5b9bd5" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-brightgreen" />
@@ -21,7 +21,7 @@
 - **Multi‑platform LLM compatibility**: via an OpenAI‑compatible SDK, supports multiple platforms (DeepSeek, SiliconFlow, Alibaba Bailian/Tongyi, Kimi/Moonshot, OpenAI, Gemini, AWS Bedrock, custom BaseURL).
 - **High‑quality extraction**: unified prompts and a TypeScript‑style schema, outputting `[{role, dialogue, reply}]`; automatically strips “thinking” prefixes from reasoning‑style models.
 - **Reply links (`reply`)**: `reply.target_index` only points backward within the same chunk; configurable look‑back window and confidence threshold.
-- **Concurrency & resume**: multithreaded processing, checkpoint resume, progress & ETA estimation; supports pause / resume / cancel.
+- **Concurrency & trustworthy resume**: multithreaded processing; a versioned manifest binds progress to the input, model, and chunking configuration, so legacy markers, missing output, or configuration changes trigger a safe retry; supports pause / resume / cancel.
 - **End‑to‑end tooling**: strict validator → role‑pair builder (A→B / B→A) → ChatML export (supports pair mode and multi‑turn stitch mode).
 - **One‑click launcher**: GUI `launcher.py` to create a virtualenv, install dependencies, start/stop the service, write `.env`, and open the frontend & docs.
 
@@ -48,7 +48,7 @@ Text2Dialog/
 ## 🚀 Installation & Run
 
 ### 1) Requirements
-- Python 3.9+ (recommended 3.10–3.12)  
+- Python 3.10–3.13 (recommended 3.10–3.12)
 - `pip` can access pypi.org
 
 ### 2) One‑click start (GUI)
@@ -56,7 +56,7 @@ Text2Dialog/
 cd Text2Dialog
 python launcher.py
 ```
-- Click “① One‑Click Setup / Repair Environment”: automatically creates `.venv` and installs `text2dialog/requirements.txt`.
+- Click “① One‑Click Setup / Repair Environment”: automatically creates `.venv` and installs the project in editable mode.
 - Click “Start Service”, then “Open Frontend” to enter the visual console.
 - In “Save API Config (.env)”, enter platform keys and the default model.
 
@@ -72,20 +72,20 @@ cd Text2Dialog
 ```
 Manual approach:
 ```bash
-cd Text2Dialog/text2dialog
-pip install -r requirements.txt
-uvicorn server:app --host 127.0.0.1 --port 8000
+cd Text2Dialog
+python -m pip install -e .
+text2dialog-server --host 127.0.0.1 --port 8000
 ```
 
 ### 4) CLI‑only extraction (no service/frontend)
 ```bash
-cd Text2Dialog/text2dialog
+cd Text2Dialog
 
 # Minimal usage: input text → output JSONL
-python dialogue_chain.py input.txt -o output.jsonl --concurrent -t 8
+text2dialog input.txt -o output.jsonl --concurrent -t 8
 
 # Common options (example):
-python dialogue_chain.py input.txt -o output.jsonl \
+text2dialog input.txt -o output.jsonl \
   --platform siliconflow --concurrent -t 8 --save-chunk-text \
   --sort-output --stats --reply-window 6 --reply-confidence-th 0.65
 ```
@@ -164,8 +164,9 @@ LLM_PLATFORM=openai
 1. Upload text (`.txt`, UTF‑8 recommended).  
 2. Set platform & model (you can override `.env` in “Advanced Settings”).  
 3. Click “Start Extraction”, monitor the progress bar & ETA; supports pause / resume / cancel.  
-4. After extraction, run: Validate Output → Role Pairing → Export ChatML.  
-5. In “Downloads”, fetch `extraction.jsonl`, `pair_datasets/`, `chatml.jsonl`.
+4. Validation must pass before role pairing and ChatML export become available.
+5. The Job ID is stored locally and in `?job=...` for refresh/share recovery; “Forget Job” clears both.
+6. Downloads expose only artifacts from the current extraction generation.
 
 ---
 
@@ -252,7 +253,7 @@ python pair_to_chatml.py -i ./pair_datasets -o ./chatml_stitch.jsonl \
   --mode stitch --max-turns 4 --include-meta
 ```
 Notes:
-- `--mode {pair|stitch}`, `--max-turns`, `--min-confidence`, `--dedupe`, `--reverse`, `--include-meta`.
+- `--mode {pair|stitch}`, `--max-turns`, `--min-confidence`, `--dedupe`, `--include-meta`; `--reverse` is stitch-only. Pair mode rejects it to avoid reversing causality.
 - System prompt: pass text via `--system` or `@path/to/file`; `--system-template` supports `{from_role}/{to_role}/{src_role}/{tgt_role}` placeholders.
 
 ---
@@ -280,15 +281,18 @@ Notes:
   }
   ```
 - `GET /api/jobs/{job_id}/progress`: returns progress, throughput, ETA, and status (running/paused/cancelling/succeeded/failed/done).
+- `GET /api/jobs/{job_id}/preview?which=extraction&limit=8`: returns a bounded `items` preview (maximum 100; `lines` is a compatibility alias).
 - `POST /api/jobs/{job_id}/control`: `{ "action": "pause|resume|cancel|force-cancel", "reason": "..." }`
-- `GET /api/jobs/{job_id}/download?which=extract|pairs|chatml`: download intermediate artifacts.
+- `GET /api/jobs/{job_id}/download?which=extraction|validated|pairs_zip|chatml`: download registered artifacts from the current generation.
 
 ### Validate / Pair / Export
 - `POST /api/validate`: `{ "job_id": "...", "input_path": "optional" }` → `{ "ok": true|false, "log": "..." }`
 - `POST /api/pairs`: `{ "job_id": "...", "pairs": ["A,B"], "min_confidence": 0.8, "strict": true, ... }`
-- `POST /api/chatml`: `{ "job_id": "...", "inputs": ["dir|glob|file"], "mode": "pair|stitch", ... }`
+- `POST /api/chatml`: `{ "job_id": "...", "input": "optional current pair path", "mode": "pair|stitch", ... }`
 
 > There is also `GET /api/defaults` to fetch default configuration; static frontend routes are served at `/` and `/static/*`.
+
+The service is local-only by default. Remote mode requires both `TEXT2DIALOG_ALLOW_REMOTE=1` and `TEXT2DIALOG_API_TOKEN`; APIs accept only `Authorization: Bearer` or `X-API-Key`, never URL tokens or cookies. Custom and environment-provided BaseURLs must be credential-free HTTPS endpoints resolving only to public addresses. Set `TEXT2DIALOG_ALLOW_LOCAL_MODEL_ENDPOINTS=1` explicitly to use a local model endpoint.
 
 ### Minimal end‑to‑end cURL
 ```bash
@@ -312,6 +316,8 @@ curl http://localhost:8000/api/jobs/<job_id>/progress
 - **Call stack**: prefer OpenAI Responses API (when available), otherwise fall back to Chat Completions.
 - **Robustness**: automatic retries, unified stripping of “thinking/reasoning” prefixes, and parsing of dual‑channel outputs (reasoning vs. content).
 - **Concurrent writeback**: internal buffer + `next_expected_chunk_id` ensure stable output ordering.
+- **Transactional publication**: ChatML is written to a same-directory temporary file and atomically replaced, preserving existing output on failure. Server-side validation, pair, and ChatML artifacts are extraction-generation bound and published from isolated staging with CAS.
+- **Trustworthy resume**: `<output>.complete` stores input/config/chunk-map SHA-256 identity; `<output>.complete.d/` stores atomic per-chunk completion records. Identity or output-evidence mismatches are never skipped.
 - **Progress persistence**: `.cache/progress.json`; control file `.cache/control.json` supports pause/resume/cancel.
 - **Validation rules** (partial):
   - `dialogue_index`: starts at 0 and increments contiguously; duplicates or gaps are errors.

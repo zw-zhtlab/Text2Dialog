@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release-gates:
+    name: Release gates (Ubuntu / Python 3.12)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install editable package and release tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Check installed dependencies
+        run: python -m pip check
+      - name: Lint Python
+        run: ruff check text2dialog launcher.py
+      - name: Compile Python sources
+        run: python -m compileall -q text2dialog launcher.py
+      - name: Check browser JavaScript syntax
+        run: node --check text2dialog/static/app.js
+      - name: Build source and wheel distributions
+        run: python -m build
+      - name: Install wheel and verify console entry points
+        shell: bash
+        run: |
+          wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel"
+          python -m venv .wheel-venv
+          .wheel-venv/bin/python -m pip install --upgrade pip
+          .wheel-venv/bin/python -m pip install "$wheel"
+          .wheel-venv/bin/python -m pip check
+          for command in text2dialog text2dialog-server text2dialog-validate text2dialog-pairs text2dialog-chatml; do
+            ".wheel-venv/bin/$command" --help
+          done
+
+  compatibility:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            python-version: "3.10"
+          - os: windows-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.13"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install editable package
+        run: python -m pip install -e .
+      - name: Check installed dependencies
+        run: python -m pip check
+      - name: Import package
+        run: python -c "import text2dialog; print(text2dialog.__version__)"

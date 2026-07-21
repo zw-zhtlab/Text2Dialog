@@ -4,6 +4,7 @@
 配置文件：统一管理对话链的所有配置
 """
 
+import math
 import os
 from typing import Dict, List, Any
 
@@ -261,16 +262,48 @@ class Config:
         """验证配置，返回错误列表"""
         errors: List[str] = []
 
+        def is_int(value: Any) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        def is_finite_number(value: Any) -> bool:
+            return (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+            )
+
         try:
             cls.get_current_platform_config()
         except ValueError as e:
             errors.append(str(e))
 
-        if cls.MAX_TOKEN_LEN <= cls.COVER_CONTENT:
+        if not is_int(cls.MAX_TOKEN_LEN) or cls.MAX_TOKEN_LEN <= 0:
+            errors.append("MAX_TOKEN_LEN必须是正整数")
+        if not is_int(cls.COVER_CONTENT) or cls.COVER_CONTENT < 0:
+            errors.append("COVER_CONTENT必须是非负整数")
+        if (
+            is_int(cls.MAX_TOKEN_LEN)
+            and cls.MAX_TOKEN_LEN > 0
+            and is_int(cls.COVER_CONTENT)
+            and cls.COVER_CONTENT >= cls.MAX_TOKEN_LEN
+        ):
             errors.append("MAX_TOKEN_LEN必须大于COVER_CONTENT")
 
-        if cls.TEMPERATURE < 0 or cls.TEMPERATURE > 2:
-            errors.append("TEMPERATURE必须在0-2之间")
+        if not is_int(cls.MAX_WORKERS) or cls.MAX_WORKERS <= 0:
+            errors.append("MAX_WORKERS必须是正整数")
+        if not is_int(cls.MAX_RETRIES) or cls.MAX_RETRIES <= 0:
+            errors.append("MAX_RETRIES必须是正整数")
+        if not is_int(cls.REPLY_WINDOW) or cls.REPLY_WINDOW <= 0:
+            errors.append("REPLY_WINDOW必须是正整数")
+
+        if not is_finite_number(cls.TEMPERATURE) or not (0 <= float(cls.TEMPERATURE) <= 2):
+            errors.append("TEMPERATURE必须是0-2之间的有限数值")
+        if not is_finite_number(cls.RETRY_DELAY) or float(cls.RETRY_DELAY) < 0:
+            errors.append("RETRY_DELAY必须是非负有限数值")
+        if not is_finite_number(cls.REPLY_CONFIDENCE_TH) or not (
+            0 <= float(cls.REPLY_CONFIDENCE_TH) <= 1
+        ):
+            errors.append("REPLY_CONFIDENCE_TH必须是0-1之间的有限数值")
 
         return errors
 
