@@ -15,14 +15,14 @@ Text2Dialog 是一个将长文本（如小说、剧本）自动抽取为结构�
 
 - **如何开始**
   - 图形化：`python launcher.py` 一键创建虚拟环境、安装依赖、启动服务与前端。
-  - 服务端：`pip install -r text2dialog/requirements.txt` → `uvicorn server:app --host 127.0.0.1 --port 8000`
+  - 服务端：`python -m pip install -e .` → `text2dialog-server --host 127.0.0.1 --port 8000`
   - 命令行：`python text2dialog/dialogue_chain.py input.txt -o out.jsonl --concurrent -t 8`
 
 ---
 
 ## 1. 架构设计总览
 - **分层视角**：接入层（FastAPI + 静态前端，`server.py`） → 业务编排层（作业管理、多进程调度、平台/配置注入） → 对话抽取核心（`dialogue_chain.py`：分块、提示构造、LLM 调用、断点续跑、进度管理） → 数据集加工层（`validate_output.py`、`pair_dataset_builder.py`、`pair_to_chatml.py`） → 持久化层（纯文件系统，`jobs/<job_id>/` 内的输入、产物、缓存、控制标记）。
-- **通信边界**：前端与后端经 REST/JSON；抽取作业由 FastAPI 主进程派生子进程（`multiprocessing.Process`）；子进程与主进程通过磁盘文件协同（`job.json`、`.cache/progress.json`、`.cache/control.json`、`.complete`），无外部 MQ/DB。
+- **通信边界**：前端与后端经 REST/JSON；抽取作业由 FastAPI 主进程派生子进程（`multiprocessing.Process`）；子进程与主进程通过磁盘文件协同（`job.json`、generation 专属 `.cache/`、版本化 `.complete` 与 `.complete.d/`），无外部 MQ/DB。
 - **核心数据契约**  
   - 抽取 JSONL：`chunk_id`、`dialogue_index`、`role`、`dialogue`、`reply|null`、可选 `chunk_text`。`reply` 为 `{target_index,target_role,confidence}`。  
   - 配对 JSONL：`source`/`reply` 端点 + `pair` + `confidence`。  
@@ -51,7 +51,7 @@ stateDiagram-v2
     running --> cancelling: control=cancel
     cancelling --> cancelled
     running --> failed: exception
-    running --> succeeded: finished+validated
+    running --> succeeded: extraction published
 ```
 - **目录结构要点**  
   - `jobs/<id>/input.txt`：原始输入  
@@ -81,7 +81,7 @@ stateDiagram-v2
 - **提示构造**：`_generate_system_prompt` 基于 schema 生成 TypeScript 描述 + 示例，追加规则（reply 窗口、跨角色约束、严格 JSON 输出）。
 - **LLM 调用韧性**：`_call_api_with_retry` 处理重试/延迟/异常；`_strip_reasoning_prefix` 去除思维链前缀；`_parse_and_validate_response` 保证每条包含 role/dialogue/reply。
 - **去重与合法化**：`_remove_duplicates` 基于哈希去重；`Config.FAIL_ON_PARSE_ERROR=False` 时会跳过坏行而不中断。
-- **并发有序落盘**：`extract_dialogues_concurrent` + `ThreadSafeDialogueChain` + `ThreadPoolExecutor`。`results_buffer` + `_next_expected_chunk_id` 保证 chunk_id 顺序；`.complete` 支撑断点续跑；`_cleanup_output_file` 清理半写行。伪代码：
+- **并发有序落盘**：`extract_dialogues_concurrent` + `ThreadSafeDialogueChain` + `ThreadPoolExecutor`。`results_buffer` + `_next_expected_chunk_id` 保证 chunk_id 顺序；`<output>.complete` 保存输入/配置/chunk-map 身份，`<output>.complete.d/` 保存逐 chunk 原子完成证据；`_cleanup_output_file` 是追加前的失败即停门禁。伪代码：
 ```python
 work_items = [WorkItem(i, chunk=...) for i in chunks if i not in processed_ids]
 future_to_item = {executor.submit(process_chunk, wi): wi for wi in work_items}
@@ -93,9 +93,9 @@ for fut in as_completed(future_to_item):
 - **进度/统计**：`_save_progress` 写速度/ETA/阶段；`get_statistics` 输出角色分布、长度分位、转移矩阵、token 估计、invalid_lines。
 
 ### 2.4 数据加工流水线
-- `validate_output.py`：强约束 chunk 有序、reply 只能指向当前或更早 chunk，`confidence∈[0,1]`，target_index 合法。
+- `validate_output.py`：强约束 chunk 有序；reply 只能指向同一 chunk 中更早且存在的发言，`target_role` 必须匹配且不能同说话者，confidence 必须是 `[0,1]` 内有限数值。
 - `pair_dataset_builder.py`：`extract_pairs()` 建 `(chunk_id, dialogue_index)->Utterance` 索引，按置信度/正则/长度/角色对过滤；严格模式要求 `confidence` 与 `target_role` 一致；支持角色展开、合并输出与 zip。
-- `pair_to_chatml.py`：`PairRecord.from_obj` 强制字段存在；`--mode pair`（单轮）/`--mode stitch`（多轮拼接，受 `--max-turns`）；支持反转、去重、系统模板、置信度过滤、meta 附带。
+- `pair_to_chatml.py`：`PairRecord.from_obj` 强制严格整数与同 chunk 因果；`--mode pair`（单轮）/`--mode stitch`（多轮拼接，受 `--max-turns`）；反转仅允许 stitch。输出先写同目录临时文件、fsync 后 `os.replace`，失败不破坏旧文件。
 
 ### 2.5 关键抽象速览
 1) `Config` / `ModelPlatform`：平台/参数唯一来源；新增配置集中管理并由 API 返回给前端。  
@@ -111,33 +111,33 @@ for fut in as_completed(future_to_item):
    - 作业 ID 为 12 位 hex；`JOBS_DIR` 在 `server.py` 启动时创建。
 2) **抽取启动**（`POST /api/jobs/{id}/extract`）  
    - Pydantic `ExtractReq` 校验平台/并发/阈值/排序/是否保存 chunk；创建 `.cache/`；写入控制状态 running。  
-   - 子进程 `_worker_extract`：平台 env 注入 + `Config` 覆写 → 实例化 `DialogueChain` → 串行或并发抽取 → 写 `extraction.jsonl`/`.complete`/`progress.json` → 可选 `sort_dialogues` → `get_statistics` 回写 `job.json`。  
+   - 每次启动先增加 `generation` 并创建 worker token/专属 cache；子进程 `_worker_extract` 写 generation staging，完成后在元数据锁内校验 generation + token，再原子发布 `extraction.gN.jsonl`。新 extraction 启动时立即失效旧 validation/pairs/ChatML/ZIP。
    - 异常处理：`CancelledError` 标记 cancelled；其他异常写 job 状态 failed。
 3) **运行时控制**（`POST /api/jobs/{id}/control`）  
    - `pause/resume/cancel` 写 `.cache/control.json`；`force-cancel` 终止子进程 PID 并清理进度。  
    - 控制协议在每个 chunk 前检查，实现软暂停/可恢复。
 4) **校验**（`POST /api/validate`）  
-   - 选取 validated 优先，其次 extraction；调用 `validate_output.validate()`，通过则复制到 `extraction.validated.jsonl` 并登记 `artifacts["validated"]`。
+   - 只允许校验当前 generation 的 canonical extraction；报告与 validated 副本先写 staging，发布前再次 CAS。失败报告不等于验证通过，下游只认 `validation_summary.ok is True` 与同 generation 的 validated artifact。
 5) **配对样本**（`POST /api/pairs`）  
    - 支持 `--pairs`/`--roles + --all-ordered-pairs`/`--list-roles`、置信度/长度/正则过滤、严格模式；输出到 `pair_datasets/` 并打包 `pairs.zip`。  
    - 角色展开：`ALL/全部` 生成所有有序对；`--all-ordered-pairs` 基于 roles 列表笛卡尔积。
 6) **ChatML 生成**（`POST /api/chatml`）  
-   - 输入 pair 目录或合并文件；可设 `--mode stitch`、`--max-turns`、`--system-template`/`--system`、`--reverse`、`--include-meta`、`--dedupe`；产物 `chatml.jsonl` 登记 `artifacts["chatml"]`。
+   - 只读取当前 generation 的 pair source；可设 `--mode stitch`、`--max-turns`、`--system-template`/`--system`、`--reverse`、`--include-meta`、`--dedupe`；pair 模式拒绝 reverse。产物经 staging/CAS 发布为 generation 专属 ChatML。
 
 ---
 
 ## 4. 状态管理与一致性
 - **持久化结构**  
-  - `job.json`：状态单源（status/message/progress/created_at/pid/cache_dir/artifacts/stats）。  
+  - `job.json`：状态单源（status/message/generation/worker_token/artifact_generations/cache_dir/artifacts/stats）；对外响应不暴露 PID、路径、凭据和 worker token。
   - `.cache/progress.json`：processed_chunks/total/ETA/速度/阶段。  
   - `.cache/control.json`：state=running/paused/cancelling + reason。  
-  - `extraction*.jsonl`：主产物；`.complete` 记录已完成 chunk_id；`.bak` 备份半写文件；排序/过滤副本可选。  
+  - `extraction.gN.jsonl`：主产物；`.complete` 是固定大小身份 manifest，`.complete.d/*.json` 是固定大小逐 chunk 记录；`.bak` 备份被清理的旧输出。
   - 下游：`extraction.validated.jsonl`、`pair_datasets/*.jsonl`、`pairs.zip`、`chatml.jsonl`。
 - **一致性保障**  
-  - 抽取：顺序写 + `.complete` 防重；`_cleanup_output_file` 清除不完整行；异常/取消仍落盘进度便于续跑。  
+  - 抽取：输出 fsync 先于完成记录；manifest 身份或输出行数证据不匹配即重跑；清理失败会中止，禁止混合追加。
   - 校验：强制 chunk 有序、reply 只指向已出现的条目、confidence 合法；未通过不生成 validated。  
   - 配对：严格模式要求 `confidence` 与 `target_role` 一致；非法文本/控制字符/黑名单全部跳过并告警。  
-  - ChatML：缺字段抛异常；`--dedupe` 去重，`--max-turns` 控制拼接长度。  
+  - 派生产物：validation、pairs、ChatML 使用 generation 专属 staging；只有锁内 CAS 成功才能替换 canonical 路径并登记 artifact。Pair 重建只打包本次 staging 文件。
   - 路径安全：`/static/{path}` 使用 commonpath 防目录穿越；下载接口检查存在且在 artifacts 中。
 - **性能/缓存关键参数**  
   - 分块：`MAX_TOKEN_LEN`（单块 token 上限）、`COVER_CONTENT`（重叠 token）、`ENCODING`。  
@@ -159,7 +159,7 @@ for fut in as_completed(future_to_item):
 ### 5.1 推荐的嵌入方式
 - **作为库调用**：优先使用 `text2dialog.pipeline`，它把原先偏 CLI 的模块包装成 dataclass API：`ExtractOptions`、`PairBuildOptions`、`ChatMLOptions`、`run_extraction()`、`validate_extraction()`、`build_pair_dataset()`、`convert_pairs_to_chatml()`、`run_dataset_pipeline()`。
 - **作为服务嵌入**：更大的 FastAPI 系统可以 `from text2dialog.server import app as text2dialog_app` 后 `app.mount("/text2dialog", text2dialog_app)`。如需外置产物目录，启动前设置 `TEXT2DIALOG_JOBS_DIR`。
-- **作为远程子服务**：启用 `TEXT2DIALOG_ALLOW_REMOTE=1` 时必须设置 `TEXT2DIALOG_API_TOKEN`，调用方使用 `Authorization: Bearer <token>` 或 `X-API-Key`。
+- **作为远程子服务**：启用 `TEXT2DIALOG_ALLOW_REMOTE=1` 时必须设置 `TEXT2DIALOG_API_TOKEN`，调用方使用 `Authorization: Bearer <token>` 或 `X-API-Key`。URL query 与 Cookie token 不被接受；前端 token 只保存在内存。
 - **服务发现**：集成方可调用 `GET /api/capabilities` 获取版本、artifact 名称、能力开关、endpoint map 与 jobs/static 目录，避免硬编码。
 
 ### 5.2 程序化流水线示例
@@ -200,7 +200,7 @@ print(result.chatml.output_path)
   - I/O：关闭 `SAVE_CHUNK_TEXT` 降低体积；`CACHE_DIR`/`jobs` 放 SSD；避免网络盘。  
   - 下游过滤：`--deny-pattern`、长度阈值、严格模式可提前剪枝，减少体积。
 - **调试技巧**  
-  - 断点续跑：保留 `extraction.jsonl` + `.complete`，再次启动同作业从下一未完成 chunk 继续。  
+  - 断点续跑：同时保留输出、`.complete` 与 `.complete.d/`；只有输入、结果相关配置和 chunk-map 身份一致且输出证据齐全时才跳过已完成 chunk。
   - 校验定位：`python validate_output.py <file>`，stderr 给出 chunk/line/di 精确指示。  
   - 质量体检：先 `--list-roles` 看角色分布，再决定有序对与阈值；观察严格模式下丢弃量。  
   - 快速回放：小样本直接调用 `DialogueChain.extract_dialogues`（串行）便于逐行打印与调试解析。  
@@ -209,9 +209,10 @@ print(result.chatml.output_path)
 ---
 
 ## 7. 可靠性、安全与运维提示
-- **幂等与续跑**：`.complete` + `_cleanup_output_file` 保证断点续跑；进度与 artifacts 均落盘，进程退出后可恢复。
+- **幂等与续跑**：身份 manifest + 逐 chunk 原子记录 + 安全清理共同保证续跑；身份未知的旧 marker 必须全量重跑。
 - **异常与告警**：抽取失败会更新 job 状态并写 message；下游 CLI 非零退出会被包装为 `{ok: False, log: ...}` 返回前端。
-- **输入安全**：`/static/{path}` 做 commonpath 校验防穿越；下载接口仅允许已登记的 artifacts；上传文本需信任来源（当前不做内容审查）。
+- **输入与网络安全**：实际 JSON body、上传、预览、角色展开、正则、并发 job 和单 job 磁盘均有限制；路径使用 realpath containment；自定义/环境 BaseURL 默认必须是解析到公网地址的无凭据 HTTPS URL。只有显式 `TEXT2DIALOG_ALLOW_LOCAL_MODEL_ENDPOINTS=1` 才允许本地模型。
+- **浏览器边界**：Host/Origin/Sec-Fetch-Site 检查、header-only 远程认证和 CSP/nosniff/DENY/no-referrer/Permissions-Policy 安全头默认启用。
 - **多平台隔离**：平台参数通过 env 注入；如需多租户/多平台并存，建议按作业粒度覆写 env，避免共享 API key。
 - **运维自检清单**：  
   - `job.json` 状态、`progress.json` ETA、`dialogue_chain.log` 是否有报错；  

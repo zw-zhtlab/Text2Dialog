@@ -6,7 +6,7 @@
 > 将长文本（如小说、剧本、纪实文本）自动抽取为结构化的角色对话与引用关系，并一键完成：质量校验 → 角色对配对 → ChatML 数据集导出。提供命令行、FastAPI 服务与可视化前端（含一键启动器）。
 
 <p align="center">
-  <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-blue" />
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10--3.13-blue" />
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.110%2B-009688" />
   <img alt="OpenAI SDK" src="https://img.shields.io/badge/SDK-openai%20compatible-5b9bd5" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-brightgreen" />
@@ -20,7 +20,7 @@
 - **多平台 LLM 兼容**：通过 OpenAI 兼容 SDK 适配多个平台（DeepSeek、硅基流动 SiliconFlow、阿里云百炼/通义、Kimi/Moonshot、OpenAI、Gemini、AWS Bedrock、自定义 BaseURL）。
 - **高质量抽取**：统一提示词与 TypeScript 风格 schema，输出 `[{role, dialogue, reply}]`；自动剥离推理型模型的“思考”前缀。
 - **引用关系(reply)**：`reply.target_index` 仅在同一 chunk 内向前引用，可配置回溯窗口与置信度阈值。
-- **并发与续跑**：多线程并发处理、断点续跑、进度与 ETA 估算，支持暂停/继续/取消。
+- **并发与可信续跑**：多线程并发处理；版本化 manifest 将进度绑定到输入、模型和切分配置，旧标记、缺失输出或配置变化会安全重跑；支持暂停/继续/取消。
 - **全链路工具**：严格校验器 → 角色对配对（A→B / B→A）→ ChatML 导出（支持 pair 模式与多轮 stitch 模式）。
 - **一键启动器**：`launcher.py` 图形化：创建虚拟环境、安装依赖、启动/停止服务、写入 `.env`、打开前端和帮助文档。
 
@@ -49,7 +49,7 @@ Text2Dialog/
 ## 🚀 安装与运行
 
 ### 1) 环境要求
-- Python 3.9+（推荐 3.10–3.12）  
+- Python 3.10–3.13（推荐 3.10–3.12）
 - `pip` 可访问 pypi.org
 
 ### 2) 一键启动（GUI）
@@ -57,7 +57,7 @@ Text2Dialog/
 cd Text2Dialog
 python launcher.py
 ```
-- 点击“① 一键配置/修复环境”：自动创建 `.venv` 并安装 `text2dialog/requirements.txt`。
+- 点击“① 一键配置/修复环境”：自动创建 `.venv` 并以可编辑模式安装项目。
 - 点击“启动服务”，再点击“打开前端”，进入可视化控制台。
 - 在“保存 API 配置(.env)”中写入平台密钥与默认模型。
 
@@ -73,20 +73,20 @@ cd Text2Dialog
 ```
 手动方式：
 ```bash
-cd Text2Dialog/text2dialog
-pip install -r requirements.txt
-uvicorn server:app --host 127.0.0.1 --port 8000
+cd Text2Dialog
+python -m pip install -e .
+text2dialog-server --host 127.0.0.1 --port 8000
 ```
 
 ### 4) 纯命令行抽取（不启用服务/前端）
 ```bash
-cd Text2Dialog/text2dialog
+cd Text2Dialog
 
 # 最简用法：输入文本 → 输出 JSONL
-python dialogue_chain.py input.txt -o output.jsonl --concurrent -t 8
+text2dialog input.txt -o output.jsonl --concurrent -t 8
 
 # 常用选项（示例）：
-python dialogue_chain.py input.txt -o output.jsonl \
+text2dialog input.txt -o output.jsonl \
   --platform siliconflow --concurrent -t 8 --save-chunk-text \
   --sort-output --stats --reply-window 6 --reply-confidence-th 0.65
 ```
@@ -165,8 +165,9 @@ LLM_PLATFORM=openai
 1. 上传文本（`.txt`，建议 UTF‑8）。  
 2. 设置平台与模型（可在“高级设置”里覆盖 `.env`）。  
 3. 点击“开始抽取”，观察进度条与 ETA；支持暂停/继续/取消。  
-4. 抽取完成后依次：校验输出 → 角色对配对 → 导出 ChatML。  
-5. 在“下载”区获取 `extraction.jsonl`、`pair_datasets/`、`chatml.jsonl`。
+4. 抽取完成后必须先通过校验，才会开放角色对配对与 ChatML 导出。
+5. Job ID 同时保存在本机和 URL 的 `?job=...` 中，可刷新/分享恢复；“忘记作业”会同时清除 URL。
+6. 在“下载”区获取当前 extraction generation 对应的产物。
 
 ---
 
@@ -253,7 +254,7 @@ python pair_to_chatml.py -i ./pair_datasets -o ./chatml_stitch.jsonl \
   --mode stitch --max-turns 4 --include-meta
 ```
 参数要点：
-- `--mode {pair|stitch}`、`--max-turns`、`--min-confidence`、`--dedupe`、`--reverse`、`--include-meta`。
+- `--mode {pair|stitch}`、`--max-turns`、`--min-confidence`、`--dedupe`、`--include-meta`；`--reverse` 仅允许用于 stitch，pair 模式会明确拒绝，避免倒置因果关系。
 - 系统提示：`--system` 传文本或 `@path/to/file`；`--system-template` 可用 `{from_role}/{to_role}/{src_role}/{tgt_role}`。
 
 ---
@@ -281,15 +282,18 @@ python pair_to_chatml.py -i ./pair_datasets -o ./chatml_stitch.jsonl \
   }
   ```
 - `GET /api/jobs/{job_id}/progress`：返回进度、速度、ETA 与状态（running/paused/cancelling/succeeded/failed/done）。
+- `GET /api/jobs/{job_id}/preview?which=extraction&limit=8`：返回最多 100 条的稳定 `items` 预览（兼容字段 `lines`）。
 - `POST /api/jobs/{job_id}/control`：`{ "action": "pause|resume|cancel|force-cancel", "reason": "..." }`
-- `GET /api/jobs/{job_id}/download?which=extract|pairs|chatml`：下载阶段性产物。
+- `GET /api/jobs/{job_id}/download?which=extraction|validated|pairs_zip|chatml`：下载当前 generation 的已登记产物。
 
 ### 校验 / 配对 / 导出
 - `POST /api/validate`：`{ "job_id": "...", "input_path": "可选" }` → `{ "ok": true|false, "log": "..." }`
 - `POST /api/pairs`：`{ "job_id": "...", "pairs": ["A,B"], "min_confidence": 0.8, "strict": true, ... }`
-- `POST /api/chatml`：`{ "job_id": "...", "inputs": ["dir|glob|file"], "mode": "pair|stitch", ... }`
+- `POST /api/chatml`：`{ "job_id": "...", "input": "可选的当前 pair 路径", "mode": "pair|stitch", ... }`
 
 > 另有 `GET /api/defaults` 用于拉取默认配置；静态前端路由位于 `/` 与 `/static/*`。
+
+服务端默认只监听本机。远程模式必须同时设置 `TEXT2DIALOG_ALLOW_REMOTE=1` 与 `TEXT2DIALOG_API_TOKEN`，API 只接受 `Authorization: Bearer` 或 `X-API-Key`；不接受 URL token 或 Cookie。自定义/环境变量 BaseURL 默认必须是解析到公网地址的 HTTPS URL；只有显式设置 `TEXT2DIALOG_ALLOW_LOCAL_MODEL_ENDPOINTS=1` 才允许本地模型地址。
 
 ### 最小可用 cURL
 ```bash
@@ -374,6 +378,8 @@ app.mount("/text2dialog", text2dialog_app)
 - **调用栈**：优先使用 OpenAI Responses API（可用时），否则回退到 Chat Completions。
 - **鲁棒性**：自动重试、统一剥离“思考/推理”前缀、解析双通道输出（reasoning vs content）。
 - **并发写回**：内部缓冲 + `next_expected_chunk_id` 确保输出顺序稳定。
+- **事务化发布**：ChatML 先写同目录临时文件并 `os.replace`；失败不会截断已有输出。服务端 validation、pairs、ChatML 均绑定 extraction generation，并经隔离 staging + CAS 发布。
+- **可信续跑**：`<output>.complete` 保存输入/配置/chunk-map SHA-256 身份，`<output>.complete.d/` 保存逐 chunk 原子完成记录；身份不匹配或输出证据缺失时不跳过。
 - **进度持久化**：`.cache/progress.json`；控制文件 `.cache/control.json` 支持暂停/继续/取消。
 - **校验规则**（节选）：
   - `dialogue_index`：从 0 连续递增；重复或跳号判错。

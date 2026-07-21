@@ -7,7 +7,7 @@
 > 長文（小説・脚本・ノンフィクション等）から構造化された登場人物の対話 + 参照関係を自動抽出し、ワンクリックで「品質検査 → 役割ペア化 → ChatML データセット出力」まで完了します。コマンドライン、FastAPI サービス、可視化フロントエンド（ワンクリック・ランチャー付き）を提供。
 
 <p align="center">
-  <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-blue" />
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10--3.13-blue" />
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.110%2B-009688" />
   <img alt="OpenAI SDK" src="https://img.shields.io/badge/SDK-openai%20compatible-5b9bd5" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-brightgreen" />
@@ -21,7 +21,7 @@
 - **複数プラットフォーム LLM 対応**：OpenAI 互換 SDK で複数プラットフォーム（DeepSeek、SiliconFlow、阿里雲百煉/通義、Kimi/Moonshot、OpenAI、Gemini、AWS Bedrock、カスタム BaseURL）に適合。
 - **高品質抽出**：統一プロンプトと TypeScript 風スキーマで `[{role, dialogue, reply}]` を出力。推論型モデルの「思考」前置きは自動で剥離。
 - **参照関係（reply）**：`reply.target_index` は同一チャンク内で過去のみを参照。回溯ウィンドウと信頼度しきい値は設定可能。
-- **併行実行と続行**：マルチスレッド併行処理、中断からの続行、進捗・ETA 推定。一時停止/再開/取消に対応。
+- **併行実行と安全な続行**：バージョン付き manifest が進捗を入力・モデル・分割設定に結び付けます。旧マーカー、出力欠落、設定変更時は安全に再実行し、一時停止/再開/取消にも対応します。
 - **フルパイプライン**：厳格な検証器 → 役割ペア化（A→B / B→A）→ ChatML 出力（pair モードと複数ターン stitch モード）。
 - **ワンクリック・ランチャー**：`launcher.py` の GUI で仮想環境作成、依存関係インストール、サービス起動/停止、`.env` 設定、フロント/ヘルプを開く。
 
@@ -48,7 +48,7 @@ Text2Dialog/
 ## 🚀 インストールと実行
 
 ### 1) 動作環境
-- Python 3.9+（推奨 3.10–3.12）  
+- Python 3.10–3.13（推奨 3.10–3.12）
 - `pip` が pypi.org にアクセス可能
 
 ### 2) ワンクリック起動（GUI）
@@ -56,7 +56,7 @@ Text2Dialog/
 cd Text2Dialog
 python launcher.py
 ```
-- 「① ワンクリック設定/環境修復」をクリック：`.venv` を自動作成し、`text2dialog/requirements.txt` をインストール。
+- 「① ワンクリック設定/環境修復」をクリック：`.venv` を自動作成し、プロジェクトを編集可能モードでインストール。
 - 「サービス起動」→「フロントを開く」の順にクリックして可視化コンソールへ。
 - 「API 設定を保存（.env）」でプラットフォームのキーと既定モデルを記入。
 
@@ -72,20 +72,20 @@ cd Text2Dialog
 ```
 手動手順：
 ```bash
-cd Text2Dialog/text2dialog
-pip install -r requirements.txt
-uvicorn server:app --host 127.0.0.1 --port 8000
+cd Text2Dialog
+python -m pip install -e .
+text2dialog-server --host 127.0.0.1 --port 8000
 ```
 
 ### 4) 純コマンドライン抽出（サービス/フロントなし）
 ```bash
-cd Text2Dialog/text2dialog
+cd Text2Dialog
 
 # 最小例：テキスト入力 → JSONL 出力
-python dialogue_chain.py input.txt -o output.jsonl --concurrent -t 8
+text2dialog input.txt -o output.jsonl --concurrent -t 8
 
 # よく使うオプション（例）：
-python dialogue_chain.py input.txt -o output.jsonl \
+text2dialog input.txt -o output.jsonl \
   --platform siliconflow --concurrent -t 8 --save-chunk-text \
   --sort-output --stats --reply-window 6 --reply-confidence-th 0.65
 ```
@@ -164,8 +164,9 @@ LLM_PLATFORM=openai
 1. テキストをアップロード（`.txt`、UTF‑8 推奨）。  
 2. プラットフォームとモデルを設定（「詳細設定」で `.env` を上書き可能）。  
 3. 「抽出開始」をクリックし、進捗バーと ETA を確認。一時停止/再開/取消に対応。  
-4. 抽出完了後に順に：出力検証 → 役割ペア化 → ChatML 出力。  
-5. 「ダウンロード」で `extraction.jsonl`、`pair_datasets/`、`chatml.jsonl` を取得。
+4. 検証に合格した後だけ、役割ペア化と ChatML 出力が有効になります。
+5. Job ID はローカルと URL の `?job=...` に保存され、更新・共有後も復元可能です。「ジョブを忘れる」で両方を消去します。
+6. ダウンロードには現在の extraction generation の成果物だけが表示されます。
 
 ---
 
@@ -252,7 +253,7 @@ python pair_to_chatml.py -i ./pair_datasets -o ./chatml_stitch.jsonl \
   --mode stitch --max-turns 4 --include-meta
 ```
 パラメータ要点：
-- `--mode {pair|stitch}`、`--max-turns`、`--min-confidence`、`--dedupe`、`--reverse`、`--include-meta`
+- `--mode {pair|stitch}`、`--max-turns`、`--min-confidence`、`--dedupe`、`--include-meta`。`--reverse` は stitch 専用で、因果関係を反転させないため pair モードでは拒否されます。
 - システムプロンプト：`--system` は本文または `@path/to/file` を許容。`--system-template` では `{from_role}/{to_role}/{src_role}/{tgt_role}` を利用可能。
 
 ---
@@ -280,15 +281,18 @@ python pair_to_chatml.py -i ./pair_datasets -o ./chatml_stitch.jsonl \
   }
   ```
 - `GET /api/jobs/{job_id}/progress`：進捗、速度、ETA、状態（running/paused/cancelling/succeeded/failed/done）を返す。
+- `GET /api/jobs/{job_id}/preview?which=extraction&limit=8`：上限 100 件の `items` プレビューを返す（`lines` は互換エイリアス）。
 - `POST /api/jobs/{job_id}/control`：`{ "action": "pause|resume|cancel|force-cancel", "reason": "..." }`
-- `GET /api/jobs/{job_id}/download?which=extract|pairs|chatml`：段階成果物をダウンロード。
+- `GET /api/jobs/{job_id}/download?which=extraction|validated|pairs_zip|chatml`：現在の generation に登録された成果物をダウンロード。
 
 ### 検証 / ペア化 / 出力
 - `POST /api/validate`：`{ "job_id": "...", "input_path": "任意" }` → `{ "ok": true|false, "log": "..." }`
 - `POST /api/pairs`：`{ "job_id": "...", "pairs": ["A,B"], "min_confidence": 0.8, "strict": true, ... }`
-- `POST /api/chatml`：`{ "job_id": "...", "inputs": ["dir|glob|file"], "mode": "pair|stitch", ... }`
+- `POST /api/chatml`：`{ "job_id": "...", "input": "任意の現在の pair パス", "mode": "pair|stitch", ... }`
 
 > さらに `GET /api/defaults` で既定設定を取得可能。静的フロントのルートは `/` および `/static/*`。
+
+既定ではローカル接続のみです。遠隔モードには `TEXT2DIALOG_ALLOW_REMOTE=1` と `TEXT2DIALOG_API_TOKEN` の両方が必要で、API 認証は `Authorization: Bearer` または `X-API-Key` のみです。URL token と Cookie は受け付けません。カスタム/環境変数の BaseURL は、既定で公開アドレスにだけ解決する資格情報なし HTTPS URL に限定されます。ローカルモデルは `TEXT2DIALOG_ALLOW_LOCAL_MODEL_ENDPOINTS=1` を明示してください。
 
 ### 最小限の cURL
 ```bash
@@ -312,6 +316,8 @@ curl http://localhost:8000/api/jobs/<job_id>/progress
 - **呼び出し**：可能なら OpenAI Responses API を優先。不可の場合は Chat Completions にフォールバック。
 - **頑健性**：自動リトライ、「思考/推論」前置きの統一剥離、二経路出力（reasoning vs content）の解析。
 - **併行書き戻し**：内部バッファ＋`next_expected_chunk_id` により出力順序を安定化。
+- **トランザクション公開**：ChatML は同一ディレクトリの一時ファイルへ書き、原子的に置換します。失敗時も既存出力を保持します。検証・pair・ChatML は extraction generation に結び付き、隔離 staging と CAS で公開されます。
+- **安全な続行**：`<output>.complete` は入力/設定/chunk-map の SHA-256 身元、`<output>.complete.d/` は chunk ごとの原子的完了記録を保持します。不一致や出力証拠欠落はスキップしません。
 - **進捗の永続化**：`.cache/progress.json`。制御ファイル `.cache/control.json` で一時停止/再開/取消をサポート。
 - **検証規則**（抜粋）：
   - `dialogue_index`：0 から連続昇順。重複や飛び番号はエラー。

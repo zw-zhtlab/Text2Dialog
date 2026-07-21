@@ -1,0 +1,8 @@
+prune tests
+prune tools
+prune .local_tests
+
+global-exclude test_*.py
+global-exclude *_test.py
+global-exclude *.py[cod]
+global-exclude __pycache__

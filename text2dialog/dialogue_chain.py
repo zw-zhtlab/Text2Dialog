@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import hashlib
 import time
 import sys
 import logging
@@ -16,6 +17,7 @@ import threading
 import statistics
 import shutil
 import math
+import tempfile
 from datetime import datetime, timezone
 from collections import Counter
 from collections import defaultdict
@@ -63,6 +65,47 @@ def _configure_logging() -> None:
 
 _configure_logging()
 logger = logging.getLogger(__name__)
+
+
+def _paths_collide(left: str, right: str) -> bool:
+    """Return whether two paths name the same destination (including links)."""
+    a = Path(left).expanduser().resolve()
+    b = Path(right).expanduser().resolve()
+    if os.path.normcase(str(a)) == os.path.normcase(str(b)):
+        return True
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _strict_int(value: Any, name: str, *, minimum: Optional[int] = None) -> int:
+    """Return an integer without accepting bools or lossy coercions."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return value
+
+
+def _finite_number(
+    value: Any,
+    name: str,
+    *,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    """Return a finite number without accepting bools or numeric strings."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be a finite number")
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"{name} must be at most {maximum}")
+    return result
 
 
 class CancelledError(RuntimeError):
@@ -233,7 +276,11 @@ class ThreadSafeDialogueChain:
 
 # ========== 主类 ==========
 class DialogueChain:
-    """对话链主类"""
+    """Extract chunk-local dialogue records with identity-bound resumption."""
+
+    RESUME_SCHEMA = "text2dialog.resume-manifest"
+    COMPLETION_SCHEMA = "text2dialog.chunk-completion"
+    RESUME_VERSION = 1
 
     # 并发写有序结果时使用
     _next_expected_chunk_id: int
@@ -256,12 +303,7 @@ class DialogueChain:
         - 与 Config.REPLY_WINDOW 同步，避免 prompt/config mismatch；
         - 配置缺失/类型异常时安全回退，不影响主流程稳定性。
         """
-        raw = getattr(Config, "REPLY_WINDOW", 6)
-        try:
-            window = int(raw)
-        except Exception:
-            window = 6
-        return max(0, window)
+        return _strict_int(getattr(Config, "REPLY_WINDOW", 6), "REPLY_WINDOW", minimum=1)
 
     def __init__(
         self,
@@ -304,7 +346,10 @@ class DialogueChain:
         self.encoder = tiktoken.get_encoding(getattr(Config, "ENCODING", "cl100k_base"))
 
         # 并发设置
-        self.max_workers = int(max_workers or getattr(Config, "MAX_WORKERS", 4))
+        configured_workers = (
+            getattr(Config, "MAX_WORKERS", 4) if max_workers is None else max_workers
+        )
+        self.max_workers = _strict_int(configured_workers, "max_workers", minimum=1)
 
         # 是否保存 chunk 原文
         self.save_chunk_text = (
@@ -334,6 +379,15 @@ class DialogueChain:
         # 质量诊断事件，不写入主 JSONL，按需生成 sidecar 报告。
         self.quality_events: List[Dict[str, Any]] = []
         self._quality_lock = threading.Lock()
+        # Prepared once per extraction so each completion update stays O(1);
+        # the fixed identity manifest and large output are never rewritten or
+        # rescanned for every chunk.
+        self._resume_manifest: Optional[Dict[str, Any]] = None
+        self._resume_output_file: Optional[str] = None
+        self._resume_chunk_sha256: List[str] = []
+        self._resume_completed: Set[int] = set()
+        self._resume_result_counts: Dict[int, int] = {}
+        self._resume_lock = threading.Lock()
 
     # ---------- 提示词 ----------
     def _generate_system_prompt(self) -> str:
@@ -397,16 +451,50 @@ IMPORTANT GUIDELINES:
                 if parts[i]:
                     sentences.append(parts[i])
 
+        max_tokens = _strict_int(
+            getattr(Config, "MAX_TOKEN_LEN", 2048), "MAX_TOKEN_LEN", minimum=1
+        )
+
+        def hard_split(text: str) -> List[str]:
+            """Losslessly split a punctuation-free span to the token budget."""
+            pieces: List[str] = []
+            remaining = text
+            while remaining:
+                if len(self.encoder.encode(remaining)) <= max_tokens:
+                    pieces.append(remaining)
+                    break
+
+                lo, hi = 1, len(remaining)
+                best = 0
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    if len(self.encoder.encode(remaining[:mid])) <= max_tokens:
+                        best = mid
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                if best == 0:
+                    raise ValueError("MAX_TOKEN_LEN is too small to encode one character")
+                pieces.append(remaining[:best])
+                remaining = remaining[best:]
+            return pieces
+
         chunks: List[str] = []
         current = ""
         for sent in sentences:
             tokens = len(self.encoder.encode(current + sent))
-            if tokens <= getattr(Config, "MAX_TOKEN_LEN", 2048):
+            if tokens <= max_tokens:
                 current += sent
             else:
                 if current:
                     chunks.append(current)
-                current = sent
+                    current = ""
+                if len(self.encoder.encode(sent)) > max_tokens:
+                    split = hard_split(sent)
+                    chunks.extend(split[:-1])
+                    current = split[-1] if split else ""
+                else:
+                    current = sent
         if current:
             chunks.append(current)
         return chunks
@@ -422,9 +510,14 @@ IMPORTANT GUIDELINES:
         cleaned_lines = [ln.strip() for ln in lines if ln.strip()]
 
         current_chunk = ""
-        current_tokens = 0
-        max_tokens = int(getattr(Config, "MAX_TOKEN_LEN", 2048))
-        cover_tokens = int(getattr(Config, "COVER_CONTENT", 0))
+        max_tokens = _strict_int(
+            getattr(Config, "MAX_TOKEN_LEN", 2048), "MAX_TOKEN_LEN", minimum=1
+        )
+        cover_tokens = _strict_int(
+            getattr(Config, "COVER_CONTENT", 0), "COVER_CONTENT", minimum=0
+        )
+        if cover_tokens >= max_tokens:
+            raise ValueError("COVER_CONTENT must be smaller than MAX_TOKEN_LEN")
 
         i = 0
         while i < len(cleaned_lines):
@@ -436,7 +529,6 @@ IMPORTANT GUIDELINES:
                 if current_chunk:
                     chunks.append(current_chunk.rstrip())
                     current_chunk = ""
-                    current_tokens = 0
 
                 # 按句子分割长行
                 for sentence in self._split_long_line(line):
@@ -444,10 +536,12 @@ IMPORTANT GUIDELINES:
                 i += 1
                 continue
 
-            # 放得下当前行：继续累积
-            if current_tokens + line_tokens + 1 <= max_tokens:
+            # Use the encoder on the exact persisted text. In particular, a
+            # line that is exactly at the budget must still be consumable when
+            # the current chunk is empty.
+            candidate_chunk = (current_chunk + line + "\n").rstrip()
+            if len(self.encoder.encode(candidate_chunk)) <= max_tokens:
                 current_chunk += line + "\n"
-                current_tokens += line_tokens + 1
                 i += 1
             else:
                 # 当前块已满，先落盘
@@ -471,7 +565,16 @@ IMPORTANT GUIDELINES:
                     j -= 1
 
                 current_chunk = ("\n".join(overlap_lines) + "\n") if overlap_lines else ""
-                current_tokens = temp_tokens
+
+                # An overlap that leaves no room for the pending line used to
+                # repeat this branch forever. Drop only as much overlap as is
+                # necessary; the pending line is then consumed next iteration.
+                while overlap_lines:
+                    candidate = "\n".join(overlap_lines + [line])
+                    if len(self.encoder.encode(candidate)) <= max_tokens:
+                        break
+                    overlap_lines.pop(0)
+                current_chunk = ("\n".join(overlap_lines) + "\n") if overlap_lines else ""
 
         # 添加最后一块
         if current_chunk:
@@ -603,9 +706,18 @@ IMPORTANT GUIDELINES:
 
     def _call_api_with_retry(self, system_prompt: str, user_prompt: str) -> str:
         """带重试的 API 调用（适配推理模型，防止思考内容污染输出）。"""
-        max_retries = int(getattr(Config, "MAX_RETRIES", 3))
-        delay = float(getattr(Config, "RETRY_DELAY", 1.0))
-        temperature = float(getattr(Config, "TEMPERATURE", 0.2))
+        max_retries = _strict_int(
+            getattr(Config, "MAX_RETRIES", 3), "MAX_RETRIES", minimum=1
+        )
+        delay = _finite_number(
+            getattr(Config, "RETRY_DELAY", 1.0), "RETRY_DELAY", minimum=0.0
+        )
+        temperature = _finite_number(
+            getattr(Config, "TEMPERATURE", 0.2),
+            "TEMPERATURE",
+            minimum=0.0,
+            maximum=2.0,
+        )
         reasoning_effort = str(getattr(Config, "REASONING_EFFORT", os.getenv("REASONING_EFFORT", ""))).strip()
 
         last_err: Optional[BaseException] = None
@@ -747,18 +859,30 @@ IMPORTANT GUIDELINES:
         if (current_index - target_index) > self._effective_reply_window():
             return None, "target_gap_exceeds_window"
 
-        confidence = reply.get("confidence", 1.0)
+        if "confidence" not in reply:
+            return None, "confidence_missing"
+        confidence = reply.get("confidence")
         if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
             return None, "confidence_not_number"
         confidence_value = float(confidence)
         if not math.isfinite(confidence_value) or not (0.0 <= confidence_value <= 1.0):
             return None, "confidence_out_of_range"
-        if confidence_value < float(getattr(Config, "REPLY_CONFIDENCE_TH", 0.0)):
+        threshold = _finite_number(
+            getattr(Config, "REPLY_CONFIDENCE_TH", 0.0),
+            "REPLY_CONFIDENCE_TH",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if confidence_value < threshold:
             return None, "confidence_below_threshold"
 
         target_role: Optional[str] = None
         if "target_role" in reply and reply["target_role"] is not None:
-            target_role = str(reply["target_role"]).strip()
+            if not isinstance(reply["target_role"], str):
+                return None, "target_role_not_string"
+            target_role = reply["target_role"].strip()
+            if not target_role:
+                return None, "target_role_empty"
 
         if prior_dialogues is not None:
             if target_index >= len(prior_dialogues):
@@ -984,45 +1108,298 @@ IMPORTANT GUIDELINES:
 
     # ---------- 完成标记 / 续跑 ----------
     def _completed_marker_path(self, output_file: str) -> str:
-        """完成标记文件路径（记录已完成的 chunk_id）。"""
+        """Return the versioned resume-identity manifest path."""
         return f"{output_file}.complete"
 
-    def _load_completed_chunk_ids(self, output_file: str) -> Set[int]:
-        """读取完成标记文件，返回已完成的 chunk_id 集合。"""
-        done: Set[int] = set()
-        try:
-            if not output_file:
-                return done
-            meta = self._completed_marker_path(output_file)
-            if not os.path.exists(meta):
-                return done
-            with open(meta, "r", encoding="utf-8") as f:
-                for line in f:
-                    s = line.strip()
-                    if not s:
-                        continue
-                    try:
-                        done.add(int(s))
-                    except Exception:
-                        continue
-        except Exception as e:
-            logger.warning(f"读取完成标记失败：{e}")
-        return done
+    @staticmethod
+    def _sha256_text(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-    def _mark_chunk_completed(self, output_file: str, chunk_id: int) -> None:
-        """将 chunk_id 追加写入完成标记文件。"""
+    def _completion_dir_path(self, output_file: str) -> Path:
+        marker = Path(self._completed_marker_path(output_file)).resolve()
+        return Path(f"{marker}.d")
+
+    def _completion_record_path(self, output_file: str, chunk_id: int) -> Path:
+        return self._completion_dir_path(output_file) / f"{chunk_id:020d}.json"
+
+    def _build_resume_identity(
+        self,
+        text: str,
+        chunks: List[str],
+        system_prompt: str,
+        output_file: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a compact identity while hashing the chunk map only once."""
+        config_values = {
+            "platform": str(getattr(self, "platform", "")),
+            "model_name": str(getattr(self, "model_name", "")),
+            # Hash endpoint-related configuration so credentials embedded in
+            # a URL can never leak into the sidecar.
+            "base_url_sha256": self._sha256_text(str(getattr(self, "base_url", "") or "")),
+            "system_prompt_sha256": self._sha256_text(system_prompt),
+            "max_token_len": getattr(Config, "MAX_TOKEN_LEN", None),
+            "cover_content": getattr(Config, "COVER_CONTENT", None),
+            "encoding": str(getattr(Config, "ENCODING", "")),
+            "temperature": getattr(Config, "TEMPERATURE", None),
+            "reasoning_effort": str(
+                getattr(Config, "REASONING_EFFORT", os.getenv("REASONING_EFFORT", ""))
+            ),
+            "reply_window": getattr(Config, "REPLY_WINDOW", None),
+            "reply_confidence_th": getattr(Config, "REPLY_CONFIDENCE_TH", None),
+            "save_chunk_text": bool(getattr(self, "save_chunk_text", False)),
+            "fail_on_parse_error": bool(getattr(Config, "FAIL_ON_PARSE_ERROR", False)),
+        }
+        config_json = json.dumps(
+            config_values,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        chunk_sha256 = [self._sha256_text(chunk) for chunk in chunks]
+        self._resume_chunk_sha256 = chunk_sha256
+        chunk_map_json = json.dumps(chunk_sha256, separators=(",", ":"))
+        identity = {
+            "schema": self.RESUME_SCHEMA,
+            "version": self.RESUME_VERSION,
+            "input_sha256": self._sha256_text(text),
+            "config_sha256": self._sha256_text(config_json),
+            "chunk_count": len(chunks),
+            "chunk_map_sha256": self._sha256_text(chunk_map_json),
+        }
+        if output_file is not None:
+            identity["completion_dir"] = self._completion_dir_path(output_file).name
+        return identity
+
+    @staticmethod
+    def _output_chunk_counts(output_file: str) -> tuple[Dict[int, int], bool]:
+        """Scan an output once, returning strict per-chunk row counts."""
+        counts: Dict[int, int] = defaultdict(int)
+        invalid = False
+        if not output_file or not os.path.exists(output_file):
+            return {}, False
+        with open(output_file, "r", encoding=getattr(Config, "OUTPUT_ENCODING", "utf-8")) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    invalid = True
+                    continue
+                if not isinstance(obj, dict):
+                    invalid = True
+                    continue
+                cid = obj.get("chunk_id")
+                if not isinstance(cid, int) or isinstance(cid, bool) or cid < 0:
+                    invalid = True
+                    continue
+                counts[cid] += 1
+        return dict(counts), invalid
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_name: Optional[str] = None
         try:
-            if not output_file:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_name = handle.name
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+            temp_name = None
+        finally:
+            if temp_name:
+                try:
+                    os.remove(temp_name)
+                except FileNotFoundError:
+                    pass
+
+    def _atomic_write_resume_manifest(self, output_file: str, manifest: Dict[str, Any]) -> None:
+        marker = Path(self._completed_marker_path(output_file)).resolve()
+        self._atomic_write_json(marker, manifest)
+
+    def _ensure_completion_dir(self, output_file: str) -> Path:
+        directory = self._completion_dir_path(output_file)
+        if directory.is_symlink():
+            raise RuntimeError(f"completion directory must not be a symlink: {directory}")
+        if directory.exists() and not directory.is_dir():
+            raise RuntimeError(f"completion path is not a directory: {directory}")
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def _reset_completion_dir(self, output_file: str) -> Path:
+        """Clear only the deterministic sidecar directory; refuse nested trees."""
+        directory = self._completion_dir_path(output_file)
+        if directory.is_symlink():
+            raise RuntimeError(f"completion directory must not be a symlink: {directory}")
+        if directory.exists():
+            if not directory.is_dir():
+                raise RuntimeError(f"completion path is not a directory: {directory}")
+            for child in directory.iterdir():
+                if child.is_symlink() or child.is_file():
+                    child.unlink()
+                else:
+                    raise RuntimeError(f"unexpected nested completion path: {child}")
+        else:
+            directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def _load_completion_records(
+        self,
+        output_file: str,
+        chunk_count: int,
+    ) -> tuple[Set[int], Dict[int, int], bool]:
+        """Load O(N) fixed-size completion records exactly once."""
+        directory = self._completion_dir_path(output_file)
+        if not directory.exists():
+            return set(), {}, True
+        if directory.is_symlink() or not directory.is_dir():
+            return set(), {}, False
+
+        completed: Set[int] = set()
+        result_counts: Dict[int, int] = {}
+        for record_path in directory.iterdir():
+            # A crash can leave an unreferenced temp. It never counts as done.
+            if record_path.is_file() and record_path.suffix == ".tmp":
+                continue
+            if record_path.is_symlink() or not record_path.is_file() or record_path.suffix != ".json":
+                return set(), {}, False
+            try:
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return set(), {}, False
+            if not isinstance(record, dict):
+                return set(), {}, False
+            cid = record.get("chunk_id")
+            count = record.get("result_count")
+            if (
+                record.get("schema") != self.COMPLETION_SCHEMA
+                or record.get("version") != self.RESUME_VERSION
+                or not isinstance(cid, int)
+                or isinstance(cid, bool)
+                or not (0 <= cid < chunk_count)
+                or cid in completed
+                or record_path.name != f"{cid:020d}.json"
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+                or record.get("chunk_sha256") != self._resume_chunk_sha256[cid]
+            ):
+                return set(), {}, False
+            completed.add(cid)
+            result_counts[cid] = count
+        return completed, result_counts, True
+
+    def _prepare_resume_manifest(
+        self,
+        output_file: str,
+        text: str,
+        chunks: List[str],
+        system_prompt: str,
+    ) -> Set[int]:
+        """Validate identity-bound resume state and clean output before appending.
+
+        The identity manifest is fixed-size. Each completed chunk owns one
+        atomically replaced fixed-size record, keeping total resume I/O O(N).
+        """
+        identity = self._build_resume_identity(
+            text,
+            chunks,
+            system_prompt,
+            output_file=output_file,
+        )
+        marker = Path(self._completed_marker_path(output_file))
+        output_exists = Path(output_file).is_file()
+        output_counts, _ = self._output_chunk_counts(output_file)
+        completed: Set[int] = set()
+        result_counts: Dict[int, int] = {}
+        valid_manifest = False
+
+        if marker.is_file():
+            try:
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                valid_manifest = all(payload.get(key) == value for key, value in identity.items())
+                if valid_manifest:
+                    completed, result_counts, records_valid = self._load_completion_records(
+                        output_file,
+                        len(chunks),
+                    )
+                    valid_manifest = records_valid
+
+        if valid_manifest and completed and not output_exists:
+            valid_manifest = False
+        if valid_manifest:
+            valid_manifest = all(
+                output_counts.get(cid, 0) == result_counts[cid] for cid in completed
+            )
+
+        if not valid_manifest:
+            if marker.is_file():
+                logger.warning("Resume manifest is stale or invalid; retrying all chunks")
+            completed = set()
+            result_counts = {}
+            self._reset_completion_dir(output_file)
+        else:
+            self._ensure_completion_dir(output_file)
+
+        # Cleanup is a gate: an error must abort before any append, otherwise
+        # rows from different runs could be mixed or duplicated.
+        self._cleanup_output_file(output_file, completed)
+        self._atomic_write_resume_manifest(output_file, identity)
+
+        self._resume_manifest = identity
+        self._resume_output_file = os.path.normcase(str(Path(output_file).resolve()))
+        self._resume_completed = completed
+        self._resume_result_counts = result_counts
+        if not hasattr(self, "_resume_lock"):
+            self._resume_lock = threading.Lock()
+        return completed
+
+    def _mark_chunk_completed(
+        self,
+        output_file: str,
+        chunk_id: int,
+        result_count: int = 0,
+    ) -> None:
+        """Publish one constant-size atomic completion record."""
+        cid = _strict_int(chunk_id, "chunk_id", minimum=0)
+        count = _strict_int(result_count, "result_count", minimum=0)
+        expected_output = os.path.normcase(str(Path(output_file).resolve()))
+        if self._resume_manifest is None or self._resume_output_file != expected_output:
+            raise RuntimeError("resume manifest was not prepared for this output")
+        chunk_count = self._resume_manifest.get("chunk_count")
+        if not isinstance(chunk_count, int) or cid >= chunk_count:
+            raise ValueError(f"chunk_id {cid} is outside the current chunk range")
+        with self._resume_lock:
+            previous_count = self._resume_result_counts.get(cid)
+            if cid in self._resume_completed and previous_count == count:
                 return
-            meta = self._completed_marker_path(output_file)
-            # 避免重复写入
-            if chunk_id in self._load_completed_chunk_ids(output_file):
-                return
-            Path(meta).resolve().parent.mkdir(parents=True, exist_ok=True)
-            with open(meta, "a", encoding="utf-8") as f:
-                f.write(f"{int(chunk_id)}\n")
-        except Exception as e:
-            logger.warning(f"写入完成标记失败：{e}")
+            if cid in self._resume_completed:
+                raise RuntimeError(f"chunk {cid} was already completed with a different count")
+            self._ensure_completion_dir(output_file)
+            payload = {
+                "schema": self.COMPLETION_SCHEMA,
+                "version": self.RESUME_VERSION,
+                "chunk_id": cid,
+                "chunk_sha256": self._resume_chunk_sha256[cid],
+                "result_count": count,
+            }
+            self._atomic_write_json(self._completion_record_path(output_file, cid), payload)
+            self._resume_completed.add(cid)
+            self._resume_result_counts[cid] = count
 
     def _cleanup_output_file(self, output_file: str, completed_ids: Set[int]) -> None:
         """
@@ -1045,7 +1422,7 @@ IMPORTANT GUIDELINES:
                         has_incomplete = True
                         continue
                     cid = obj.get("chunk_id")
-                    if isinstance(cid, int) and cid in completed_ids:
+                    if isinstance(cid, int) and not isinstance(cid, bool) and cid in completed_ids:
                         dst.write(line if line.endswith("\n") else line + "\n")
                     else:
                         has_incomplete = True
@@ -1069,47 +1446,7 @@ IMPORTANT GUIDELINES:
                     os.remove(tmp_path)
             except Exception:
                 pass
-
-    def _scan_processed_chunk_ids(self, output_file: str) -> Set[int]:
-        """
-        扫描已处理的 chunk_id 集合：
-        - 优先读取 .complete 完成标记文件；
-        - 否则从输出文件推断，保守丢弃最后一个 chunk（可能未写全）。
-        """
-        processed: Set[int] = set()
-        try:
-            completed_from_marker = self._load_completed_chunk_ids(output_file)
-            if completed_from_marker:
-                return completed_from_marker
-            if not output_file or not os.path.exists(output_file):
-                return processed
-
-            last_seen: Optional[int] = None
-            ordered_ids: List[int] = []
-
-            with open(output_file, "r", encoding=getattr(Config, "OUTPUT_ENCODING", "utf-8")) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    cid = obj.get("chunk_id")
-                    if not isinstance(cid, int):
-                        continue
-                    if last_seen is None or cid != last_seen:
-                        ordered_ids.append(cid)
-                        last_seen = cid
-
-            if not ordered_ids:
-                return processed
-
-            processed.update(ordered_ids[:-1])
-        except Exception as e:
-            logger.warning(f"扫描已处理 chunk 失败：{e}")
-        return processed
+            raise RuntimeError(f"failed to safely clean output file: {output_file}") from e
 
     def _first_missing_index(self, done_ids: Set[int]) -> int:
         """从 0 开始，找到第一个缺失的 chunk_id（用于续跑起点）。"""
@@ -1132,6 +1469,12 @@ IMPORTANT GUIDELINES:
         """
         logger.info(f"开始处理文本：{file_path}")
 
+        if output_file is None:
+            file_name = Path(file_path).stem
+            output_file = f"{file_name}_dialogues.{getattr(Config, 'OUTPUT_FORMAT', 'jsonl')}"
+        if _paths_collide(file_path, output_file):
+            raise ValueError("输入文件与输出文件不能是同一路径")
+
         # 0) 进入初始化/分块阶段
         self._save_progress(file_path, 0, 0, stage="chunking", message="正在切分文本…")
 
@@ -1143,39 +1486,36 @@ IMPORTANT GUIDELINES:
 
         system_prompt = self._generate_system_prompt()
 
-        if output_file is None:
-            file_name = Path(file_path).stem
-            output_file = f"{file_name}_dialogues.{getattr(Config, 'OUTPUT_FORMAT', 'jsonl')}"
-
         # 确保输出目录存在
         out_dir = Path(output_file).resolve().parent
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # 进度恢复：优先使用 progress.json；如不可用，退回扫描输出文件（避免重复写）
-        processed_chunks = self._load_progress(file_path) or 0
-        processed_from_file = 0
-        existing_ids = self._scan_processed_chunk_ids(output_file)
-        if os.path.exists(output_file):
-            self._cleanup_output_file(output_file, existing_ids)
+        # A scalar progress count cannot describe holes. Only durable per-chunk
+        # completion evidence is safe to use for skipping work.
+        reported_progress = self._load_progress(file_path) or 0
+        existing_ids = self._prepare_resume_manifest(
+            output_file,
+            text,
+            chunks,
+            system_prompt,
+        )
         if existing_ids:
-            for cid in sorted(existing_ids):
-                self._mark_chunk_completed(output_file, cid)
-            processed_from_file = self._first_missing_index(existing_ids)
-        if processed_from_file > processed_chunks:
-            processed_chunks = processed_from_file
-            logger.info(f"检测到可续跑进度：已完成 {processed_chunks}/{len(chunks)} 块")
+            logger.info(f"检测到可续跑进度：已完成 {len(existing_ids)}/{len(chunks)} 块")
+        if reported_progress and reported_progress != len(existing_ids):
+            logger.warning("忽略与完成标记不一致的标量进度，以已完成 chunk_id 为准")
 
         total_dialogues = 0
-        was_cancelled = False
+        failed_details: List[str] = []
 
         with tqdm(
             total=len(chunks),
             desc="提取对话",
-            initial=processed_chunks,
+            initial=len(existing_ids),
             disable=not self._tqdm_enabled(),
         ) as pbar:
             for i, chunk in enumerate(chunks):
-                if i < processed_chunks:
+                if i in existing_ids:
                     continue
 
                 # 新增：在进入新块前响应暂停/取消
@@ -1183,13 +1523,11 @@ IMPORTANT GUIDELINES:
                     self.control.wait_if_paused()
                     self.control.raise_if_cancelled()
                 except CancelledError:
-                    # 标记并优雅收尾
                     self._save_progress(
-                        file_path, i, len(chunks),
+                        file_path, len(existing_ids), len(chunks),
                         stage="cancelled", message="用户取消"
                     )
-                    was_cancelled = True
-                    break
+                    raise
 
                 try:
                     response = self._call_api_with_retry(system_prompt, chunk)
@@ -1214,8 +1552,11 @@ IMPORTANT GUIDELINES:
                                 ensure_ascii=False,
                             )
                             f.write("\n")
+                        f.flush()
+                        os.fsync(f.fileno())
 
-                    self._mark_chunk_completed(output_file, i)
+                    self._mark_chunk_completed(output_file, i, len(unique_dialogues))
+                    existing_ids.add(i)
                     total_dialogues += len(unique_dialogues)
 
                     # 保存进度
@@ -1238,31 +1579,32 @@ IMPORTANT GUIDELINES:
                     # 取消发生在 API 调用或之后
                     self._save_progress(
                         file_path,
-                        i,  # 当前块不计入
+                        len(existing_ids),
                         len(chunks),
                         stage="cancelled",
                         message="用户取消",
                     )
-                    was_cancelled = True
-                    break
+                    raise
                 except Exception as e:
                     logger.error(f"处理第 {i + 1} 块时发生错误：{e}")
+                    failed_details.append(f"chunk {i}: {e}")
                     # 保持进度写入（不中断）
                     self._save_progress(
                         file_path,
-                        i,  # 当前块失败不计入 processed
+                        len(existing_ids),
                         len(chunks),
                         stage="processing",
                         message=f"处理第 {i + 1} 块时发生错误：{e}",
                     )
                     continue
 
-        # 收尾（不在此删除 progress.json；由 server 子进程统一清理）
-        if was_cancelled:
-            logger.info("处理被用户取消。")
-        else:
-            self._save_progress(file_path, len(chunks), len(chunks), stage="done", message="处理完成")
-            logger.info(f"处理完成！共提取 {total_dialogues} 条对话，保存到：{output_file}")
+        if failed_details:
+            summary = f"{len(failed_details)} 个 chunk 处理失败"
+            self._save_progress(file_path, len(existing_ids), len(chunks), stage="failed", message=summary)
+            raise RuntimeError(f"{summary}: {'; '.join(failed_details[:3])}")
+
+        self._save_progress(file_path, len(chunks), len(chunks), stage="done", message="处理完成")
+        logger.info(f"处理完成！共提取 {total_dialogues} 条对话，保存到：{output_file}")
         return output_file
 
     # ---------- 并发提取 ----------
@@ -1279,6 +1621,12 @@ IMPORTANT GUIDELINES:
         """
         logger.info(f"开始并发处理文本：{file_path}")
 
+        if output_file is None:
+            file_name = Path(file_path).stem
+            output_file = f"{file_name}_dialogues_concurrent.{getattr(Config, 'OUTPUT_FORMAT', 'jsonl')}"
+        if _paths_collide(file_path, output_file):
+            raise ValueError("输入文件与输出文件不能是同一路径")
+
         # 0) 初始化/分块提示
         self._save_progress(file_path, 0, 0, stage="chunking", message="正在切分文本…")
 
@@ -1291,20 +1639,16 @@ IMPORTANT GUIDELINES:
 
         system_prompt = self._generate_system_prompt()
 
-        if output_file is None:
-            file_name = Path(file_path).stem
-            output_file = f"{file_name}_dialogues_concurrent.{getattr(Config, 'OUTPUT_FORMAT', 'jsonl')}"
-
         # 确保输出目录存在
         Path(output_file).resolve().parent.mkdir(parents=True, exist_ok=True)
 
         # 续跑支持：扫描已写出的 chunk，过滤重复任务，并定位按序写入起点
-        processed_ids: Set[int] = self._scan_processed_chunk_ids(output_file)
-        if os.path.exists(output_file):
-            self._cleanup_output_file(output_file, processed_ids)
-        if processed_ids:
-            for cid in sorted(processed_ids):
-                self._mark_chunk_completed(output_file, cid)
+        processed_ids: Set[int] = self._prepare_resume_manifest(
+            output_file,
+            text,
+            chunks,
+            system_prompt,
+        )
         next_expected = self._first_missing_index(processed_ids)
         if processed_ids:
             logger.info(f"检测到已完成 {len(processed_ids)} 个 chunk，将从 {next_expected} 开始续跑")
@@ -1344,9 +1688,11 @@ IMPORTANT GUIDELINES:
                     for d in dialogues:
                         json.dump(d.to_dict(include_chunk_text=self.save_chunk_text), f, ensure_ascii=False)
                         f.write("\n")
+                    f.flush()
+                    os.fsync(f.fileno())
                 self._next_expected_chunk_id += 1
                 if cid in successful_chunks:
-                    self._mark_chunk_completed(output_file, cid)
+                    self._mark_chunk_completed(output_file, cid, len(dialogues))
 
         def mark_chunk_failed(chunk_id: int, err: Optional[BaseException] = None) -> None:
             """标记 chunk 失败（写空占位），以推进写入序列。"""
@@ -1479,7 +1825,7 @@ IMPORTANT GUIDELINES:
                 self._save_progress(file_path, len(completed_chunks), len(chunks), stage="cancelled", message="用户取消")
             except Exception:
                 pass
-            return output_file
+            raise CancelledError("用户取消")
 
         # 如有失败或工作线程报错，则宣告失败并抛出异常让上层感知
         worker_errors = len(thread_safe_extractor.errors)
@@ -1799,7 +2145,7 @@ def main() -> int:
         "-t",
         "--threads",
         type=int,
-        default=int(getattr(Config, "MAX_WORKERS", 4)),
+        default=getattr(Config, "MAX_WORKERS", 4),
         help=f"并发线程数（默认：{getattr(Config, 'MAX_WORKERS', 4)}）",
     )
     parser.add_argument(
@@ -1841,13 +2187,13 @@ def main() -> int:
     parser.add_argument(
         "--reply-window",
         type=int,
-        default=int(getattr(Config, "REPLY_WINDOW", 8)),
+        default=getattr(Config, "REPLY_WINDOW", 8),
         help=f"reply 可回溯窗口大小（默认：{getattr(Config, 'REPLY_WINDOW', 8)}）",
     )
     parser.add_argument(
         "--reply-confidence-th",
         type=float,
-        default=float(getattr(Config, "REPLY_CONFIDENCE_TH", 0.0)),
+        default=getattr(Config, "REPLY_CONFIDENCE_TH", 0.0),
         help=f"reply 置信度阈值（默认：{getattr(Config, 'REPLY_CONFIDENCE_TH', 0.0)}，低于该值将清除 reply）",
     )
 
@@ -1855,7 +2201,10 @@ def main() -> int:
 
     # 列出平台
     if args.list_platforms:
-        from config import ModelPlatform
+        try:
+            from .config import ModelPlatform
+        except ImportError:  # pragma: no cover - direct script execution
+            from config import ModelPlatform
 
         print("=== 支持的平台 ===")
         for name, description in ModelPlatform.list_platforms().items():
@@ -1864,8 +2213,21 @@ def main() -> int:
         return 0
 
     # 覆盖部分 Config 运行时参数（对当前进程有效）
-    Config.REPLY_WINDOW = max(1, int(args.reply_window))
-    Config.REPLY_CONFIDENCE_TH = max(0.0, min(1.0, float(args.reply_confidence_th)))
+    try:
+        args.threads = _strict_int(args.threads, "--threads", minimum=1)
+        args.reply_window = _strict_int(
+            args.reply_window, "--reply-window", minimum=1
+        )
+        args.reply_confidence_th = _finite_number(
+            args.reply_confidence_th,
+            "--reply-confidence-th",
+            minimum=0.0,
+            maximum=1.0,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    Config.REPLY_WINDOW = args.reply_window
+    Config.REPLY_CONFIDENCE_TH = args.reply_confidence_th
 
     # 必要参数校验
     if not args.input_file:

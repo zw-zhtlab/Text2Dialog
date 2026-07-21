@@ -54,7 +54,6 @@ def validate(path: str) -> int:
         return 1
 
     chunk_index_maps: Dict[int, Dict[int, ChunkEntry]] = {}
-    chunk_lengths: Dict[int, int] = {}
 
     for cid, entries in sorted(by_chunk.items()):
         seen_indices = set()
@@ -112,7 +111,6 @@ def validate(path: str) -> int:
                 _error(f"[chunk {cid}] line {line_no} di={dialogue_index}: 预期 dialogue_index 为 {expected_idx}")
                 ok = False
         chunk_index_maps[cid] = index_map
-        chunk_lengths[cid] = len(entries)
 
     for cid, entries in sorted(by_chunk.items()):
         for entry in entries:
@@ -131,45 +129,42 @@ def validate(path: str) -> int:
 
             target_chunk_id = reply.get('target_chunk_id', cid)
             if not _is_int(target_chunk_id) or target_chunk_id < 0:
-                _error(f"[chunk {cid}] line {line_no} di={dialogue_index}: 无效的 target_chunk_id {target_chunk_id!r}")
+                _error(
+                    f"[chunk {cid}] line {line_no} di={dialogue_index}: "
+                    f"invalid target_chunk_id {target_chunk_id!r}"
+                )
+                ok = False
+                continue
+            if target_chunk_id != cid:
+                _error(
+                    f"[chunk {cid}] line {line_no} di={dialogue_index}: "
+                    "reply must reference an earlier utterance in the same chunk"
+                )
                 ok = False
                 continue
 
-            target_chunk = chunk_index_maps.get(target_chunk_id)
-            target_len = chunk_lengths.get(target_chunk_id)
-            if target_chunk is None or target_len is None:
-                _error(f"[chunk {cid}] line {line_no} di={dialogue_index}: 引用的 chunk {target_chunk_id} 不存在")
+            target_chunk = chunk_index_maps.get(cid)
+            if target_chunk is None:
+                _error(
+                    f"[chunk {cid}] line {line_no} di={dialogue_index}: "
+                    "current chunk is missing"
+                )
                 ok = False
                 continue
-
-            if target_chunk_id == cid:
-                if not (0 <= target_index < dialogue_index):
-                    _error(
-                        f"[chunk {cid}] line {line_no} di={dialogue_index}: 本地 reply 必须指向更早的索引，收到 {target_index}"
-                    )
-                    ok = False
-                    continue
-                if target_index not in target_chunk:
-                    _error(
-                        f"[chunk {cid}] line {line_no} di={dialogue_index}: 在 chunk {target_chunk_id} 中未找到 target_index {target_index}"
-                    )
-                    ok = False
-                    continue
-            else:
-                if target_chunk_id >= cid:
-                    _error(f"[chunk {cid}] line {line_no} di={dialogue_index}: 不能指向未来的 chunk {target_chunk_id}")
-                    ok = False
-                    continue
-                if not (0 <= target_index < target_len):
-                    _error(f"[chunk {cid}] line {line_no} di={dialogue_index}: target_index {target_index} 超出 chunk {target_chunk_id} 的范围（大小 {target_len}）")
-                    ok = False
-                    continue
-                if target_index not in target_chunk:
-                    _error(
-                        f"[chunk {cid}] line {line_no} di={dialogue_index}: 在 chunk {target_chunk_id} 中未找到 target_index {target_index}"
-                    )
-                    ok = False
-                    continue
+            if not (0 <= target_index < dialogue_index):
+                _error(
+                    f"[chunk {cid}] line {line_no} di={dialogue_index}: "
+                    f"reply must reference an earlier local index, got {target_index}"
+                )
+                ok = False
+                continue
+            if target_index not in target_chunk:
+                _error(
+                    f"[chunk {cid}] line {line_no} di={dialogue_index}: "
+                    f"target_index {target_index} is absent from chunk {cid}"
+                )
+                ok = False
+                continue
 
             confidence = reply.get('confidence')
             if confidence is None or not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not math.isfinite(confidence) or not (0.0 <= float(confidence) <= 1.0):
@@ -178,9 +173,24 @@ def validate(path: str) -> int:
                 )
                 ok = False
 
+            target_record = target_chunk[target_index]['record']
+            actual_target_role = target_record['role'].strip()
+            current_role = record['role'].strip()
             target_role = reply.get('target_role')
-            if target_role is not None and not isinstance(target_role, str):
-                _error(f"[chunk {cid}] line {line_no} di={dialogue_index}: target_role 若存在则必须为字符串")
+            if not isinstance(target_role, str) or not target_role.strip():
+                _error(f"[chunk {cid}] line {line_no} di={dialogue_index}: target_role 必须是非空字符串")
+                ok = False
+            elif target_role.strip() != actual_target_role:
+                _error(
+                    f"[chunk {cid}] line {line_no} di={dialogue_index}: target_role "
+                    f"{target_role!r} 与被引用发言的 role {actual_target_role!r} 不一致"
+                )
+                ok = False
+
+            if current_role == actual_target_role:
+                _error(
+                    f"[chunk {cid}] line {line_no} di={dialogue_index}: reply 不能指向同一 speaker"
+                )
                 ok = False
 
     print('通过' if ok else '失败', file=sys.stderr)
