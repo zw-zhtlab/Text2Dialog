@@ -115,6 +115,17 @@ def _as_path(value: PathLike, *, create_parent: bool = False) -> Path:
     return path
 
 
+def _ensure_distinct_paths(inputs: Sequence[Path], outputs: Sequence[Path]) -> None:
+    for output in outputs:
+        for source in inputs:
+            if chatml_mod.paths_collide(source, output):
+                raise ValueError(f"output path must not overwrite an input: {output}")
+    for index, output in enumerate(outputs):
+        for other in outputs[index + 1:]:
+            if chatml_mod.paths_collide(output, other):
+                raise ValueError(f"output paths must be distinct: {output}")
+
+
 def _coerce_pair(item: Any) -> Tuple[str, str]:
     if isinstance(item, str):
         if "," not in item:
@@ -262,6 +273,20 @@ def build_pair_dataset(input_path: PathLike, options: Optional[PairBuildOptions]
     role_pairs = _resolve_role_pairs(source, opts)
     diagnostics: Optional[List[Dict[str, Any]]] = [] if opts.diagnostics_out else None
 
+    out_dir = Path(opts.out_dir) if opts.out_dir else None
+    merge_out = Path(opts.merge_out) if opts.merge_out else None
+    prospective_outputs: List[Path] = []
+    if merge_out:
+        prospective_outputs.append(merge_out)
+    else:
+        target_dir = out_dir or Path("pair_datasets")
+        prospective_outputs.extend(
+            target_dir / pairs_mod._safe_pair_name(src, tgt) for src, tgt in role_pairs
+        )
+    if opts.diagnostics_out:
+        prospective_outputs.append(Path(opts.diagnostics_out))
+    _ensure_distinct_paths([source], prospective_outputs)
+
     buckets = pairs_mod.extract_pairs(
         jsonl_path=source,
         role_pairs=role_pairs,
@@ -277,8 +302,6 @@ def build_pair_dataset(input_path: PathLike, options: Optional[PairBuildOptions]
         diagnostics=diagnostics,
     )
 
-    out_dir = Path(opts.out_dir) if opts.out_dir else None
-    merge_out = Path(opts.merge_out) if opts.merge_out else None
     pairs_mod.write_outputs(buckets, out_dir=out_dir, merge_file=merge_out)
 
     diagnostics_path = None
@@ -313,6 +336,8 @@ def convert_pairs_to_chatml(
 
     system_text = chatml_mod.load_text_maybe_from_file(opts.system_text)
     system_template = chatml_mod.load_text_maybe_from_file(opts.system_template)
+    output = _as_path(output_path)
+    _ensure_distinct_paths(discovered, [output])
     records = chatml_mod.convert_pair_to_chatml(
         inputs=discovered,
         mode=opts.mode,
@@ -320,18 +345,12 @@ def convert_pairs_to_chatml(
         reverse_roles=opts.reverse,
         system_text=system_text,
         system_template=system_template,
-        max_turns=max(1, int(opts.max_turns or 1)),
+        max_turns=opts.max_turns,
         include_meta=opts.include_meta,
         dedupe=opts.dedupe,
     )
 
-    output = _as_path(output_path, create_parent=True)
-    count = 0
-    with output.open("w", encoding="utf-8") as f:
-        for obj in records or []:
-            json.dump(obj, f, ensure_ascii=False)
-            f.write("\n")
-            count += 1
+    count = chatml_mod.write_jsonl_atomic(output, records)
     return ChatMLResult(output_path=output, count=count)
 
 

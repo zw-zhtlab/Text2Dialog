@@ -40,7 +40,7 @@ pair_to_chatml.py
 - 输入：单个文件、目录（自动抓取 *.jsonl）、或 glob（如 data/pair_*.jsonl）。
 - 模式：pair / stitch（同 chunk 连续轮拼接）。
 - 过滤：最小置信度、去重。
-- 角色：默认将 source→user、reply→assistant；可反转。
+- 角色：pair 固定 source→user、reply→assistant；仅 stitch 可交换说话者映射。
 - 系统提示：默认“生成对输入内容的回复。”；也支持固定字符串或模板（可用 {from_role}/{to_role} 等变量）。
 - 输出：写入 JSONL；可选附带 meta（pair、chunk、index、confidence 等）方便回溯。
 
@@ -58,10 +58,11 @@ python pair_to_chatml.py \
   --mode stitch --max-turns 6 \
   --system-template "你现在扮演 {to_role}，将与 {from_role} 进行对话，请准确、自然地回应。"
 
-# 3) 读取合并文件 + 最小置信度过滤 + 反转角色（把 reply 当作 user）
+# 3) stitch 模式读取合并文件 + 最小置信度过滤 + 交换说话者映射
 python pair_to_chatml.py \
   -i ./pair_datasets/all_pairs.jsonl \
   -o ./sft_chatml_rev.jsonl \
+  --mode stitch \
   --min-confidence 0.85 \
   --reverse
 
@@ -74,16 +75,53 @@ python pair_to_chatml.py \
 import argparse
 import dataclasses
 import glob
-import io
 import json
+import math
 import os
-import random
-import re
+import string
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union, DefaultDict
 from collections import defaultdict
+
+
+def _strict_nonnegative_int(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _strict_positive_int(value: Any, field: str) -> int:
+    result = _strict_nonnegative_int(value, field)
+    if result == 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return result
+
+
+def _strict_confidence(value: Any, field: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite number in [0, 1]")
+    result = float(value)
+    if not math.isfinite(result) or not (0.0 <= result <= 1.0):
+        raise ValueError(f"{field} must be a finite number in [0, 1]")
+    return result
+
+
+def _validate_system_template(value: Optional[str]) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str):
+        raise ValueError("system_template must be a string")
+    allowed = {"from_role", "to_role", "src_role", "tgt_role"}
+    try:
+        fields = [field for _, field, _, _ in string.Formatter().parse(value) if field]
+    except ValueError as exc:
+        raise ValueError(f"invalid system_template: {exc}") from exc
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"unknown system_template fields: {sorted(unknown)}")
 
 # -----------------------------
 # 数据结构（与 pair_dataset_builder.py 对齐）
@@ -114,19 +152,52 @@ class PairRecord:
             raise ValueError(f"missing source/reply: {e}")
 
         def _endpoint(d: Dict[str, Any]) -> Endpoint:
+            if not isinstance(d, dict):
+                raise ValueError("endpoint must be an object")
+            role = d.get("role")
+            text = d.get("text")
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError("endpoint role must be a non-empty string")
+            if not isinstance(text, str):
+                raise ValueError("endpoint text must be a string")
             return Endpoint(
-                chunk_id=int(d["chunk_id"]),
-                dialogue_index=int(d["dialogue_index"]),
-                role=str(d["role"]),
-                text=str(d["text"]),
+                chunk_id=_strict_nonnegative_int(d.get("chunk_id"), "chunk_id"),
+                dialogue_index=_strict_nonnegative_int(
+                    d.get("dialogue_index"), "dialogue_index"
+                ),
+                role=role,
+                text=text,
             )
 
+        source = _endpoint(src)
+        reply = _endpoint(tgt)
+        if source.chunk_id != reply.chunk_id:
+            raise ValueError("reply must reference the same chunk as source")
+        if source.dialogue_index >= reply.dialogue_index:
+            raise ValueError("reply must be later than source")
+        if norm(source.role) == norm(reply.role):
+            raise ValueError("source and reply roles must differ")
+        raw_confidence = obj.get("confidence", None)
+        confidence = (
+            None
+            if raw_confidence is None
+            else _strict_confidence(raw_confidence, "confidence")
+        )
+        pair_obj = obj.get("pair", {})
+        if not isinstance(pair_obj, dict):
+            raise ValueError("pair must be an object")
+        pair_from = pair_obj.get("from", source.role)
+        pair_to = pair_obj.get("to", reply.role)
+        if not isinstance(pair_from, str) or not isinstance(pair_to, str):
+            raise ValueError("pair roles must be strings")
+        if norm(pair_from) != norm(source.role) or norm(pair_to) != norm(reply.role):
+            raise ValueError("pair roles must match source/reply roles")
         pr = PairRecord(
-            source=_endpoint(src),
-            reply=_endpoint(tgt),
-            pair_from=str(obj.get("pair", {}).get("from", src.get("role", ""))),
-            pair_to=str(obj.get("pair", {}).get("to", tgt.get("role", ""))),
-            confidence=(obj.get("confidence", None)),
+            source=source,
+            reply=reply,
+            pair_from=pair_from,
+            pair_to=pair_to,
+            confidence=confidence,
         )
         return pr
 
@@ -147,12 +218,53 @@ def read_jsonl(path: Union[str, Path]) -> Iterator[Dict[str, Any]]:
                 print(f"[WARN] {p} line {ln}: skip invalid JSON ({e})", file=sys.stderr)
 
 def write_jsonl(path: Union[str, Path], items: Iterable[Dict[str, Any]]) -> None:
+    write_jsonl_atomic(path, items)
+
+
+def write_jsonl_atomic(
+    path: Union[str, Path],
+    items: Iterable[Dict[str, Any]],
+) -> int:
+    """Write JSONL to a same-directory temp and atomically publish it."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        for obj in items:
-            json.dump(obj, f, ensure_ascii=False)
-            f.write("\n")
+    temp_name: Optional[str] = None
+    count = 0
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=p.parent,
+            prefix=f".{p.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            for obj in items:
+                json.dump(obj, handle, ensure_ascii=False, allow_nan=False)
+                handle.write("\n")
+                count += 1
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, p)
+        temp_name = None
+        return count
+    finally:
+        if temp_name:
+            try:
+                os.remove(temp_name)
+            except FileNotFoundError:
+                pass
+
+
+def paths_collide(left: Union[str, Path], right: Union[str, Path]) -> bool:
+    a, b = Path(left).expanduser().resolve(), Path(right).expanduser().resolve()
+    if os.path.normcase(str(a)) == os.path.normcase(str(b)):
+        return True
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
 
 def discover_inputs(inputs: Sequence[str]) -> List[Path]:
     out: List[Path] = []
@@ -184,11 +296,15 @@ def content_ok(s: str, min_len: int = 1) -> bool:
     return isinstance(s, str) and len(norm(s)) >= min_len
 
 def passes_confidence(c: Optional[float], th: Optional[float]) -> bool:
-    if th is None:  # 不过滤
-        return True
     try:
-        return (c is not None) and (float(c) >= float(th))
-    except Exception:
+        if c is None:
+            return th is None
+        value = _strict_confidence(c, "confidence")
+        if th is None:
+            return True
+        threshold = _strict_confidence(th, "min_confidence")
+        return value >= threshold
+    except ValueError:
         return False
 
 def default_system() -> str:
@@ -299,7 +415,15 @@ def group_for_stitch_bidirectional(pairs: Iterable[PairRecord]) -> Dict[BiStitch
     """
     buckets: DefaultDict[BiStitchKey, List[PairRecord]] = defaultdict(list)
     for pr in pairs:
-        a, b = _bi_key(pr.pair_from, pr.pair_to)
+        # Cross-chunk and backwards edges cannot form a chronological ChatML
+        # conversation and must never be stitched together.
+        if pr.source.chunk_id != pr.reply.chunk_id:
+            continue
+        if pr.source.dialogue_index >= pr.reply.dialogue_index:
+            continue
+        if norm(pr.source.role) == norm(pr.reply.role):
+            continue
+        a, b = _bi_key(pr.source.role, pr.reply.role)
         key = BiStitchKey(chunk_id=pr.source.chunk_id, role_a=a, role_b=b)
         buckets[key].append(pr)
     # 桶内按 source.index 再 reply.index 排序，利于稳定构链
@@ -314,9 +438,9 @@ def stitch_sequences_bidirectional(records: List[PairRecord], max_turns: int) ->
     采用贪心策略：从最早的样本开始，尽量延长，避免交叉复用（消费掉已用边）。
     """
     # 按 source 起点建立索引： (role, index) -> [record_index...]
-    by_source: DefaultDict[Tuple[str, int], List[int]] = defaultdict(list)
+    by_source: DefaultDict[Tuple[int, str, int], List[int]] = defaultdict(list)
     for i, r in enumerate(records):
-        by_source[(r.source.role, r.source.dialogue_index)].append(i)
+        by_source[(r.source.chunk_id, r.source.role, r.source.dialogue_index)].append(i)
     # 每个列表按 reply.index 升序，尽量选择最近的下一轮
     for k in by_source:
         by_source[k].sort(key=lambda i: records[i].reply.dialogue_index)
@@ -341,7 +465,7 @@ def stitch_sequences_bidirectional(records: List[PairRecord], max_turns: int) ->
             last = cur[-1]
             expect_role = last.reply.role
             expect_idx = last.reply.dialogue_index
-            cands = by_source.get((expect_role, expect_idx), [])
+            cands = by_source.get((last.reply.chunk_id, expect_role, expect_idx), [])
             # 选择首个尚未使用的候选
             next_idx = None
             for ci in cands:
@@ -371,6 +495,41 @@ def convert_pair_to_chatml(
     include_meta: bool = False,
     dedupe: bool = False,
 ) -> Iterator[Dict[str, Any]]:
+    """Validate conversion options eagerly, then return a lazy record iterator."""
+    if mode not in {"pair", "stitch"}:
+        raise ValueError(f"unknown mode: {mode}")
+    _strict_positive_int(max_turns, "max_turns")
+    if min_confidence is not None:
+        _strict_confidence(min_confidence, "min_confidence")
+    if mode == "pair" and reverse_roles:
+        raise ValueError("reverse_roles is not supported in pair mode")
+    if system_text is not None and not isinstance(system_text, str):
+        raise ValueError("system_text must be a string")
+    _validate_system_template(system_template)
+    return _convert_pair_to_chatml_iter(
+        inputs=inputs,
+        mode=mode,
+        min_confidence=min_confidence,
+        reverse_roles=reverse_roles,
+        system_text=system_text,
+        system_template=system_template,
+        max_turns=max_turns,
+        include_meta=include_meta,
+        dedupe=dedupe,
+    )
+
+
+def _convert_pair_to_chatml_iter(
+    inputs: Sequence[Path],
+    mode: str = "pair",
+    min_confidence: Optional[float] = None,
+    reverse_roles: bool = False,
+    system_text: Optional[str] = None,
+    system_template: Optional[str] = None,
+    max_turns: int = 1,
+    include_meta: bool = False,
+    dedupe: bool = False,
+) -> Iterator[Dict[str, Any]]:
     """
     将 pair JSONL 转为 ChatML JSONL（逐条 yield）。
 
@@ -378,14 +537,21 @@ def convert_pair_to_chatml(
     - mode="stitch": 同 chunk & 同角色对 的连续 PairRecord 拼接为一个多轮 ChatML，
       最多 max_turns 轮。
 
-    角色映射：
-      默认：source → user, reply → assistant；
-      若 reverse_roles=True：source → assistant, reply → user。
+    角色映射：pair 固定 source → user、reply → assistant；stitch 可通过
+    reverse_roles 交换说话者与 ChatML user/assistant 的映射，但不倒置时间。
 
     系统提示：
       优先使用 system_template（可含 {from_role}/{to_role}/{src_role}/{tgt_role} 占位符）；
       否则使用 system_text；两者都缺省则不注入系统消息。
     """
+    if mode not in {"pair", "stitch"}:
+        raise ValueError(f"unknown mode: {mode}")
+    _strict_positive_int(max_turns, "max_turns")
+    if min_confidence is not None:
+        _strict_confidence(min_confidence, "min_confidence")
+    if mode == "pair" and reverse_roles:
+        raise ValueError("reverse_roles is not supported in pair mode")
+
     # 1) 读取 & 过滤 & 归并
     all_pairs: List[PairRecord] = []
     seen_sig: set = set()  # 用于去重
@@ -412,15 +578,17 @@ def convert_pair_to_chatml(
 
     def build_system(pr: PairRecord) -> Optional[str]:
         if system_template:
+            from_role, to_role = pr.pair_from, pr.pair_to
+            if mode == "stitch" and reverse_roles:
+                from_role, to_role = to_role, from_role
             fmt_vars = dict(
-                from_role=pr.pair_from, to_role=pr.pair_to,
+                from_role=from_role, to_role=to_role,
                 src_role=pr.source.role, tgt_role=pr.reply.role,
             )
             try:
                 return system_template.format(**fmt_vars)
             except Exception as e:
-                print(f"[WARN] system-template format error: {e}", file=sys.stderr)
-                return None
+                raise ValueError(f"system-template format error: {e}") from e
         elif system_text:
             return system_text
         else:
@@ -430,9 +598,6 @@ def convert_pair_to_chatml(
     if mode == "pair":
         for pr in all_pairs:
             u_txt, a_txt = (pr.source.text, pr.reply.text)
-            u_role, a_role = ("user", "assistant")
-            if reverse_roles:
-                u_txt, a_txt = a_txt, u_txt
             msgs: List[ChatMessage] = []
             sys_msg = build_system(pr)
             if sys_msg:
@@ -463,37 +628,36 @@ def convert_pair_to_chatml(
                 sys_msg = build_system(sess[0])
                 if sys_msg:
                     msgs.append(ChatMessage(role="system", content=sys_msg))
-                # 依次展开为 user/assistant 轮；避免重复加入“重叠”的上一轮回复
-                # 会话的 user/assistant 对应到具体说话人：以首条样本的方向为准
+                # Expand the directed edge chain into one chronological list
+                # of utterances, then map speakers to ChatML roles. Reversal
+                # changes the speaker mapping; it never reverses time.
                 first = sess[0]
-                user_speaker = first.pair_from
-                assistant_speaker = first.pair_to
+                user_speaker = first.source.role
+                assistant_speaker = first.reply.role
                 if reverse_roles:
                     user_speaker, assistant_speaker = assistant_speaker, user_speaker
 
-                # 先放入首轮完整的 user→assistant
-                if not reverse_roles:
-                    msgs.append(ChatMessage(role="user", content=norm(first.source.text)))
-                    msgs.append(ChatMessage(role="assistant", content=norm(first.reply.text)))
-                else:
-                    # 反转：以 reply 作为 user 的第一句
-                    msgs.append(ChatMessage(role="user", content=norm(first.reply.text)))
-                    msgs.append(ChatMessage(role="assistant", content=norm(first.source.text)))
-
-                # 后续各轮只追加“新出现”的一边
-                for pr in sess[1:]:
-                    # pr.pair_from 表示当前这条边的说话人（源）
-                    # 如果源是 assistant_speaker，说明上一轮我们已经加入了它的内容（assistant）；
-                    # 此时只需追加用户的新一句（reply）。反之亦然。
-                    if pr.pair_from == assistant_speaker:
-                        # assistant -> user，只追加用户的回复
-                        msgs.append(ChatMessage(role="user", content=norm(pr.reply.text)))
-                    elif pr.pair_from == user_speaker:
-                        # user -> assistant，只追加助手的回复
-                        msgs.append(ChatMessage(role="assistant", content=norm(pr.reply.text)))
+                utterances = [first.source] + [edge.reply for edge in sess]
+                mapped: List[ChatMessage] = []
+                for utterance in utterances:
+                    if utterance.role == user_speaker:
+                        mapped.append(ChatMessage(role="user", content=norm(utterance.text)))
+                    elif utterance.role == assistant_speaker:
+                        mapped.append(ChatMessage(role="assistant", content=norm(utterance.text)))
                     else:
-                        # 理论上不会发生，保险起见忽略之
-                        continue
+                        mapped = []
+                        break
+
+                while mapped and mapped[0].role != "user":
+                    mapped.pop(0)
+                while mapped and mapped[-1].role != "assistant":
+                    mapped.pop()
+                if len(mapped) < 2 or any(
+                    message.role != ("user" if i % 2 == 0 else "assistant")
+                    for i, message in enumerate(mapped)
+                ):
+                    continue
+                msgs.extend(mapped)
                 meta = None
                 if include_meta:
                     meta = {
@@ -504,8 +668,6 @@ def convert_pair_to_chatml(
                         "confidences": [p.confidence for p in sess],
                     }
                 yield ChatRecord(messages=msgs, meta=meta).to_json(include_meta=include_meta)
-    else:
-        raise ValueError(f"unknown mode: {mode}")
 
 # -----------------------------
 # CLI
@@ -530,7 +692,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--max-turns", type=int, default=4, help="stitch 模式下，每个会话最大轮数（默认 4）")
     ap.add_argument("--min-confidence", type=float, default=None, help="过滤最小置信度（默认不过滤）")
     ap.add_argument("--dedupe", action="store_true", help="按 (source.text, reply.text) 去重")
-    ap.add_argument("--reverse", action="store_true", help="反转角色：把 reply 当作 user")
+    ap.add_argument(
+        "--reverse",
+        action="store_true",
+        help="仅 stitch 模式：交换说话者到 user/assistant 的映射",
+    )
     ap.add_argument("--system", dest="system_text", default=None,
                     help="系统消息文本；若以 @ 开头，视为从文件读取内容")
     ap.add_argument("--system-template", default=None,
@@ -543,30 +709,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not inputs:
         return 2
 
+    out_path = Path(args.out)
+    if any(paths_collide(path, out_path) for path in inputs):
+        print("[ERR] output path must not overwrite an input JSONL", file=sys.stderr)
+        return 2
+
     system_text = load_text_maybe_from_file(args.system_text)
     system_template = load_text_maybe_from_file(args.system_template)
 
-    items = convert_pair_to_chatml(
-        inputs=inputs,
-        mode=args.mode,
-        min_confidence=args.min_confidence,
-        reverse_roles=args.reverse,
-        system_text=system_text,
-        system_template=system_template,
-        max_turns=max(1, int(args.max_turns or 1)),
-        include_meta=args.include_meta,
-        dedupe=args.dedupe,
-    )
-
-    # 写出
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f:
-        count = 0
-        for obj in items or []:
-            json.dump(obj, f, ensure_ascii=False)
-            f.write("\n")
-            count += 1
+    try:
+        items = convert_pair_to_chatml(
+            inputs=inputs,
+            mode=args.mode,
+            min_confidence=args.min_confidence,
+            reverse_roles=args.reverse,
+            system_text=system_text,
+            system_template=system_template,
+            max_turns=args.max_turns,
+            include_meta=args.include_meta,
+            dedupe=args.dedupe,
+        )
+        count = write_jsonl_atomic(out_path, items)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"[ERR] ChatML conversion failed: {exc}", file=sys.stderr)
+        return 2
     print(f"[OK] wrote {count} ChatML records -> {out_path}")
     return 0
 

@@ -4,7 +4,7 @@
 Text2Dialog Launcher（图形化一键启动器）
 =================================================
 为项目 Text2Dialog 提供：
-- 一键自动配置 Python 虚拟环境并安装依赖（requirements.txt）
+- 一键自动配置 Python 虚拟环境并以可编辑模式安装项目
 - 启动 / 关闭 FastAPI 服务（uvicorn）
 - 查看 / 打开“控制台”（日志窗口，可复制）
 - 一键打开前端页面（浏览器）
@@ -13,28 +13,250 @@ Text2Dialog Launcher（图形化一键启动器）
 
 使用方式
 -------------------------------------------------
-1) 电脑已安装 Python 3.9+（推荐 3.10~3.12）。
+1) 电脑已安装 Python 3.10+（支持 3.10~3.13）。
 2) 将本文件 `launcher.py` 放到与 `text2dialog/` 同级的目录（项目根目录）。
 3) 直接运行：  `python launcher.py`  或在资源管理器中双击（Windows）。
 """
 
 from __future__ import annotations
+
 import os
-import sys
-import subprocess
-import threading
+import platform
 import queue
+import re
+import subprocess
+import sys
+import tempfile
+import threading
 import time
 import webbrowser
-import platform
+from dataclasses import dataclass
 from pathlib import Path
-from tkinter import Tk, Toplevel, Text, BOTH, X, Y, END, DISABLED, NORMAL
-from tkinter import ttk, messagebox, filedialog
+from tkinter import BOTH, DISABLED, END, NORMAL, X, Text, Tk, Toplevel
+from tkinter import messagebox, ttk
 
 PROJECT_DIR = Path(__file__).resolve().parent
 APP_DIR = PROJECT_DIR / "text2dialog"
-REQ_FILE = APP_DIR / "requirements.txt"
 HELP_PATH = PROJECT_DIR / "帮助文档.html"
+
+
+@dataclass(frozen=True)
+class ProviderEnvSpec:
+    """Environment-variable names consumed by one supported provider."""
+
+    label: str
+    api_key_env: str
+    base_url_env: str
+    model_env: str
+
+
+PROVIDER_ENV_SPECS: dict[str, ProviderEnvSpec] = {
+    "siliconflow": ProviderEnvSpec(
+        "硅基流动 SiliconFlow",
+        "SILICONFLOW_API_KEY",
+        "SILICONFLOW_BASE_URL",
+        "SILICONFLOW_MODEL_NAME",
+    ),
+    "deepseek": ProviderEnvSpec(
+        "DeepSeek",
+        "DEEPSEEK_API",
+        "DEEPSEEK_BASE_URL",
+        "DEEPSEEK_MODEL_NAME",
+    ),
+    "bailian": ProviderEnvSpec(
+        "阿里云百炼 / 通义千问",
+        "DASHSCOPE_API_KEY",
+        "BAILIAN_BASE_URL",
+        "BAILIAN_MODEL_NAME",
+    ),
+    "moonshot": ProviderEnvSpec(
+        "月之暗面 Moonshot / Kimi",
+        "MOONSHOT_API_KEY",
+        "MOONSHOT_BASE_URL",
+        "MOONSHOT_MODEL_NAME",
+    ),
+    "openai": ProviderEnvSpec(
+        "OpenAI",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL_NAME",
+    ),
+    "gemini": ProviderEnvSpec(
+        "Google Gemini (OpenAI 兼容接口)",
+        "GEMINI_API_KEY",
+        "GEMINI_BASE_URL",
+        "GEMINI_MODEL_NAME",
+    ),
+    "aws_bedrock": ProviderEnvSpec(
+        "AWS Bedrock",
+        "AWS_BEDROCK_API_KEY",
+        "AWS_BEDROCK_BASE_URL",
+        "AWS_BEDROCK_MODEL_NAME",
+    ),
+    "custom": ProviderEnvSpec(
+        "自定义 OpenAI 兼容接口",
+        "CUSTOM_API_KEY",
+        "CUSTOM_BASE_URL",
+        "CUSTOM_MODEL_NAME",
+    ),
+}
+
+_ENV_ASSIGNMENT_RE = re.compile(
+    r"^(?P<indent>\s*)(?P<export>export\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=.*$"
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(?P<key>[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)|DEEPSEEK_API)"
+    r"\s*(?P<separator>[:=])\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_SECRET_HEADER_RE = re.compile(
+    r"(?i)\b(?P<header>Authorization|X-API-Key)\s*:\s*(?:Bearer\s+)?[^\s,;]+"
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_URL_CREDENTIAL_RE = re.compile(r"(?i)(https?://)([^/@\s:]+):([^/@\s]+)@")
+_TOKEN_SHAPE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+_SECRET_COMMAND_FLAGS = frozenset(
+    {"--api-key", "--api_key", "--password", "--secret", "--token", "--x-api-key"}
+)
+
+
+def redact_sensitive_text(value: object) -> str:
+    """Return log-safe text without common credential representations."""
+
+    text = str(value)
+    text = _SECRET_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group('key')}{match.group('separator')}[REDACTED]",
+        text,
+    )
+    text = _SECRET_HEADER_RE.sub(
+        lambda match: f"{match.group('header')}: [REDACTED]",
+        text,
+    )
+    text = _BEARER_RE.sub("Bearer [REDACTED]", text)
+    text = _URL_CREDENTIAL_RE.sub(r"\1[REDACTED]@", text)
+    return _TOKEN_SHAPE_RE.sub("[REDACTED]", text)
+
+
+def redact_command_args(args: list[str]) -> list[str]:
+    """Redact values following common credential-bearing command flags."""
+
+    redacted: list[str] = []
+    hide_next = False
+    for arg in args:
+        if hide_next:
+            redacted.append("[REDACTED]")
+            hide_next = False
+            continue
+        flag, separator, _ = arg.partition("=")
+        normalized_flag = flag.casefold()
+        if normalized_flag in _SECRET_COMMAND_FLAGS:
+            redacted.append(
+                f"{flag}=[REDACTED]" if separator else flag
+            )
+            hide_next = not separator
+            continue
+        redacted.append(redact_sensitive_text(arg))
+    return redacted
+
+
+def provider_env_updates(
+    provider: str,
+    *,
+    api_key: str = "",
+    base_url: str = "",
+    model_name: str = "",
+) -> dict[str, str]:
+    """Build provider-specific updates without routing values through OpenAI keys."""
+
+    try:
+        spec = PROVIDER_ENV_SPECS[provider]
+    except KeyError as exc:
+        raise ValueError(f"不支持的平台：{provider}") from exc
+
+    updates = {"LLM_PLATFORM": provider}
+    for key, value in (
+        (spec.api_key_env, api_key),
+        (spec.base_url_env, base_url),
+        (spec.model_env, model_name),
+    ):
+        normalized = value.strip()
+        if normalized:
+            updates[key] = normalized
+    return updates
+
+
+def _quote_dotenv_value(value: str) -> str:
+    if any(character in value for character in ("\x00", "\r", "\n")):
+        raise ValueError("环境变量值不能包含 NUL 或换行符")
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
+def _upsert_env_text(original: str, updates: dict[str, str]) -> str:
+    """Replace each requested key once while retaining unrelated lines and comments."""
+
+    if not updates:
+        return original
+    invalid_keys = [
+        key for key in updates if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) is None
+    ]
+    if invalid_keys:
+        raise ValueError("环境变量名不合法")
+
+    newline = "\r\n" if "\r\n" in original else "\n"
+    output: list[str] = []
+    replaced: set[str] = set()
+    for line in original.splitlines():
+        match = _ENV_ASSIGNMENT_RE.match(line)
+        key = match.group("key") if match else None
+        if key not in updates:
+            output.append(line)
+            continue
+        if key in replaced:
+            continue
+        prefix = match.group("indent") + (match.group("export") or "")
+        output.append(f"{prefix}{key}={_quote_dotenv_value(updates[key])}")
+        replaced.add(key)
+
+    if output and output[-1] != "" and any(key not in replaced for key in updates):
+        output.append("")
+    for key, value in updates.items():
+        if key not in replaced:
+            output.append(f"{key}={_quote_dotenv_value(value)}")
+    return newline.join(output).rstrip("\r\n") + newline
+
+
+def atomic_upsert_env(path: Path, updates: dict[str, str]) -> None:
+    """Atomically upsert dotenv keys, preserving the old file on every failure."""
+
+    path = Path(path)
+    original = path.read_text(encoding="utf-8-sig") if path.exists() else ""
+    rendered = _upsert_env_text(original, updates)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="")
+        descriptor = -1
+        with handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.exists():
+            os.chmod(temporary_path, path.stat().st_mode)
+        else:
+            os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    except BaseException:
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary_path.unlink(missing_ok=True)
+        finally:
+            raise
 
 
 class Launcher:
@@ -152,13 +374,13 @@ class Launcher:
     def append_log(self, msg: str, to_console: bool = True):
         """线程安全：任何线程都可以调用。统一带时间戳，UTF-8 文本。"""
         ts = time.strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}\n"
+        line = f"[{ts}] {redact_sensitive_text(msg)}\n"
         self.log_queue.put(line)
         self._schedule_flush()
 
     def append_raw(self, raw: str):
         """用于子进程块输出（已处理编码/换行），不加额外换行。"""
-        self.log_queue.put(raw)
+        self.log_queue.put(redact_sensitive_text(raw))
         self._schedule_flush()
 
     def detect_python(self) -> str:
@@ -171,11 +393,14 @@ class Launcher:
 
     def ensure_app_layout(self) -> bool:
         if not APP_DIR.exists():
-            messagebox.showerror("未找到项目", f"未在 {PROJECT_DIR} 下发现 text2dialog/ 目录。\n"
-                                 "请将 launcher.py 放在项目根目录，与 text2dialog 同级。")
+            messagebox.showerror(
+                "未找到项目",
+                f"未在 {PROJECT_DIR} 下发现 text2dialog/ 目录。\n"
+                "请将 launcher.py 放在项目根目录，与 text2dialog 同级。",
+            )
             return False
-        if not REQ_FILE.exists():
-            messagebox.showerror("缺少依赖文件", f"未找到 {REQ_FILE.name}")
+        if not (PROJECT_DIR / "pyproject.toml").exists():
+            messagebox.showerror("缺少项目元数据", "未找到 pyproject.toml")
             return False
         return True
 
@@ -227,7 +452,7 @@ class Launcher:
         通用子进程执行：按块读取输出并写入日志（线程安全）。
         注意：此函数在调用线程内阻塞执行，适合安装/构建等一次性任务。
         """
-        self.append_log(f"$ {' '.join(args)}")
+        self.append_log(f"$ {' '.join(redact_command_args(args))}")
         p = subprocess.Popen(
             args,
             cwd=str(cwd) if cwd else None,
@@ -267,8 +492,8 @@ class Launcher:
             vpy = self.venv_python()
             self.append_log("升级 pip …")
             self.run_and_stream([vpy, "-m", "pip", "install", "--upgrade", "pip"])
-            self.append_log("安装项目依赖 requirements.txt …（可能需要数分钟）")
-            code = self.run_and_stream([vpy, "-m", "pip", "install", "-r", str(REQ_FILE)])
+            self.append_log("安装 Text2Dialog 项目与依赖…（可能需要数分钟）")
+            code = self.run_and_stream([vpy, "-m", "pip", "install", "-e", str(PROJECT_DIR)])
             if code != 0:
                 raise RuntimeError("安装依赖失败")
 
@@ -279,8 +504,9 @@ class Launcher:
                 self.btn_open_ui.config(state="normal")
             ))
         except Exception as e:
-            self.append_log(f"环境配置失败：{e}")
-            self.ui(lambda: messagebox.showerror("失败", f"环境配置失败：{e}"))
+            error_message = f"环境配置失败：{redact_sensitive_text(e)}"
+            self.append_log(error_message)
+            self.ui(lambda message=error_message: messagebox.showerror("失败", message))
         finally:
             self.ui(lambda: self.btn_setup.config(state="normal"))
 
@@ -297,14 +523,13 @@ class Launcher:
         host = self.host_var.get().strip() or "127.0.0.1"
         port = self.port_var.get().strip() or "8000"
 
-        # 以项目子目录为工作目录启动 uvicorn（server:app 位于 text2dialog 内）
-        cmd = [vpy, "-m", "uvicorn", "server:app", "--host", host, "--port", port]
+        cmd = [vpy, "-m", "uvicorn", "text2dialog.server:app", "--host", host, "--port", port]
         # 统一 UTF-8 + 实时输出；禁用 tqdm，避免后台 tqd m \r 刷新导致的管道堆积
         env = self._make_child_env(disable_tqdm=True)
 
         self.append_log("启动服务中…")
         self.proc = subprocess.Popen(
-            cmd, cwd=str(APP_DIR), env=env,
+            cmd, cwd=str(PROJECT_DIR), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             bufsize=0, text=False  # 二进制无缓冲读取
         )
@@ -442,79 +667,77 @@ class Launcher:
     def save_env_dialog(self):
         win = Toplevel(self.master)
         win.title("保存 API 配置到 .env")
-        win.geometry("640x520")
+        win.geometry("640x420")
 
         frm = ttk.Frame(win, padding=12)
         frm.pack(fill=BOTH, expand=True)
 
-        ttk.Label(frm, text="在下方填写你可用的平台 API Key（可留空）。点击“保存 .env”后可随时修改。").pack(anchor="w")
+        ttk.Label(
+            frm,
+            text=(
+                "选择一个平台并填写对应配置。空白字段会保留 .env 中的已有值；"
+                "API Key 不会显示在日志中。"
+            ),
+            wraplength=600,
+        ).pack(anchor="w")
 
-        items = [
-            ("OpenAI", "OPENAI_API_KEY", ""),
-            ("Moonshot Kimi", "MOONSHOT_API_KEY", ""),
-            ("Google Gemini", "GEMINI_API_KEY", ""),
-            ("DeepSeek", "DEEPSEEK_API", ""),
-            ("SiliconFlow", "SILICONFLOW_API_KEY", ""),
-            ("阿里百炼/通义", "DASHSCOPE_API_KEY", ""),
-            ("Qwen/阿里", "QWEN_API_KEY", ""),
-            ("AWS Bedrock", "AWS_BEDROCK_API_KEY", ""),
-        ]
-
-        self.env_entries = []
         grid = ttk.Frame(frm)
-        grid.pack(fill=X, pady=(8, 0))
+        grid.pack(fill=X, pady=(12, 0))
+        grid.columnconfigure(1, weight=1)
 
-        for i, (label, key, _) in enumerate(items):
-            ttk.Label(grid, text=label, width=16).grid(row=i, column=0, sticky="w", pady=6)
-            ttk.Label(grid, text=key, width=24, foreground="#666").grid(row=i, column=1, sticky="w", pady=6)
-            e = ttk.Entry(grid, width=36)
-            e.grid(row=i, column=2, sticky="we", pady=6)
-            self.env_entries.append((key, e))
+        labels = [spec.label for spec in PROVIDER_ENV_SPECS.values()]
+        self.provider_ids_by_label = {
+            spec.label: provider for provider, spec in PROVIDER_ENV_SPECS.items()
+        }
+        ttk.Label(grid, text="平台").grid(row=0, column=0, sticky="w", pady=6, padx=(0, 12))
+        self.provider_entry = ttk.Combobox(grid, values=labels, state="readonly")
+        self.provider_entry.grid(row=0, column=1, sticky="ew", pady=6)
+        self.provider_entry.set(PROVIDER_ENV_SPECS["siliconflow"].label)
 
-        grid.columnconfigure(2, weight=1)
+        ttk.Label(grid, text="API Key").grid(row=1, column=0, sticky="w", pady=6, padx=(0, 12))
+        self.api_key_entry = ttk.Entry(grid, show="•")
+        self.api_key_entry.grid(row=1, column=1, sticky="ew", pady=6)
 
-        ttk.Separator(frm).pack(fill=X, pady=10)
+        ttk.Label(grid, text="Base URL（可选）").grid(
+            row=2,
+            column=0,
+            sticky="w",
+            pady=6,
+            padx=(0, 12),
+        )
+        self.base_url_entry = ttk.Entry(grid)
+        self.base_url_entry.grid(row=2, column=1, sticky="ew", pady=6)
 
-        # 其他常用设置
-        opt = ttk.Frame(frm)
-        opt.pack(fill=X)
-
-        self.base_url_entry = ttk.Entry(opt, width=48)
-        ttk.Label(opt, text="（可选）统一自定义 Base URL（OpenAI 兼容）").pack(anchor="w")
-        self.base_url_entry.pack(fill=X, pady=6)
-
-        self.model_name_entry = ttk.Entry(opt, width=48)
-        ttk.Label(opt, text="（可选）默认模型名（如 gpt-4o-mini / kimi-k2-0905-preview）").pack(anchor="w")
-        self.model_name_entry.pack(fill=X, pady=6)
+        ttk.Label(grid, text="模型名（可选）").grid(
+            row=3,
+            column=0,
+            sticky="w",
+            pady=6,
+            padx=(0, 12),
+        )
+        self.model_name_entry = ttk.Entry(grid)
+        self.model_name_entry.grid(row=3, column=1, sticky="ew", pady=6)
 
         ttk.Button(frm, text="保存 .env", command=self._write_env).pack(pady=10)
 
     def _write_env(self):
-        kvs = {}
-        for key, entry in self.env_entries:
-            val = entry.get().strip()
-            if val:
-                kvs[key] = val
-        base_url = self.base_url_entry.get().strip()
-        model_name = self.model_name_entry.get().strip()
-        if base_url:
-            kvs["OPENAI_BASE_URL"] = base_url
-        if model_name:
-            kvs["OPENAI_MODEL_NAME"] = model_name
-
-        if not kvs:
-            messagebox.showinfo("未填写", "没有任何内容需要写入。")
-            return
-
-        lines = [f"{k}={v}" for k, v in kvs.items()]
         env_path = PROJECT_DIR / ".env"
         try:
-            with open(env_path, "a", encoding="utf-8") as f:
-                f.write("\n" + "\n".join(lines) + "\n")
+            provider = self.provider_ids_by_label[self.provider_entry.get()]
+            updates = provider_env_updates(
+                provider,
+                api_key=self.api_key_entry.get(),
+                base_url=self.base_url_entry.get(),
+                model_name=self.model_name_entry.get(),
+            )
+            atomic_upsert_env(env_path, updates)
             messagebox.showinfo("已保存", f".env 已更新：{env_path}")
-            self.append_log(f"已写入 .env：{', '.join(kvs.keys())}")
+            self.append_log(f"已更新 .env 配置项：{', '.join(updates)}")
+            self.api_key_entry.delete(0, END)
         except Exception as e:
-            messagebox.showerror("失败", f"写入 .env 失败：{e}")
+            safe_error = redact_sensitive_text(e)
+            self.append_log(f"写入 .env 失败：{safe_error}")
+            messagebox.showerror("失败", f"写入 .env 失败：{safe_error}")
 
     # -------------------- 初始化 --------------------
     def post_init(self):

@@ -51,6 +51,8 @@ python pair_dataset_builder.py -i output.jsonl --validate-path path/to/validate_
 
 import argparse
 import json
+import math
+import os
 import re
 import sys
 import unicodedata
@@ -69,6 +71,21 @@ def _norm_role(s: str) -> str:
     return (s or "").strip()
 
 
+def _strict_nonnegative_int(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _strict_confidence(value: Any, field: str = "confidence") -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite number in [0, 1]")
+    result = float(value)
+    if not math.isfinite(result) or not (0.0 <= result <= 1.0):
+        raise ValueError(f"{field} must be a finite number in [0, 1]")
+    return result
+
+
 def _preview_text(value: Any, limit: int = 80) -> str:
     text = re.sub(r"\s+", " ", str(value or "").strip())
     if len(text) <= limit:
@@ -84,6 +101,16 @@ def _safe_pair_name(src: str, tgt: str) -> str:
         s = re.sub(r'\s+', '_', s)           # 空白压缩为 '_'
         return s or "EMPTY"
     return f"pair_{safe(src)}__to__{safe(tgt)}.jsonl"
+
+
+def _paths_collide(left: Path, right: Path) -> bool:
+    a, b = left.expanduser().resolve(), right.expanduser().resolve()
+    if os.path.normcase(str(a)) == os.path.normcase(str(b)):
+        return True
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 def _read_jsonl(path: Path) -> Iterable[Tuple[int, Dict[str, Any]]]:
@@ -144,9 +171,9 @@ def _is_text_legal(text: str,
     if not isinstance(text, str):
         return False
     t = text.strip()
-    if len(t) < int(min_chars):
+    if len(t) < min_chars:
         return False
-    if max_chars is not None and len(t) > int(max_chars):
+    if max_chars is not None and len(t) > max_chars:
         return False
     if "\uFFFD" in t:
         return False
@@ -233,10 +260,15 @@ def build_index(records: Iterable[Tuple[int, Dict[str, Any]]]):
     bad = 0
     for line_no, rec in records:
         try:
-            cid = int(rec["chunk_id"])
-            di = int(rec["dialogue_index"])
-            role = _norm_role(str(rec["role"]))
-            text = str(rec.get("dialogue") or rec.get("text") or "")
+            cid = _strict_nonnegative_int(rec["chunk_id"], "chunk_id")
+            di = _strict_nonnegative_int(rec["dialogue_index"], "dialogue_index")
+            if not isinstance(rec["role"], str):
+                raise ValueError("role must be a string")
+            role = _norm_role(rec["role"])
+            raw_text = rec.get("dialogue", rec.get("text", ""))
+            if not isinstance(raw_text, str):
+                raise ValueError("dialogue must be a string")
+            text = raw_text
             if not role:
                 raise ValueError("空 role")
         except Exception as e:
@@ -278,12 +310,14 @@ def _resolve_reply_target(cur: Utterance, idx: Dict[UtteranceKey, Utterance]):
         return None
 
     try:
-        target_index = reply.get("target_index", None)
-        target_chunk_id = reply.get("target_chunk_id", cur.key.chunk_id)
-        if target_index is None:
+        target_index = _strict_nonnegative_int(reply.get("target_index"), "target_index")
+        target_chunk_id = _strict_nonnegative_int(
+            reply.get("target_chunk_id", cur.key.chunk_id), "target_chunk_id"
+        )
+        if target_chunk_id != cur.key.chunk_id or target_index >= cur.key.index:
             return None
-        src_key = UtteranceKey(int(target_chunk_id), int(target_index))
-    except Exception:
+        src_key = UtteranceKey(target_chunk_id, target_index)
+    except (TypeError, ValueError):
         return None
 
     src = idx.get(src_key, None)
@@ -293,13 +327,15 @@ def _resolve_reply_target(cur: Utterance, idx: Dict[UtteranceKey, Utterance]):
     conf = reply.get("confidence", None)
     if conf is not None:
         try:
-            conf = float(conf)
-        except Exception:
-            conf = None
+            conf = _strict_confidence(conf)
+        except ValueError:
+            return None
 
     t_role = reply.get("target_role", None)
     if t_role is not None:
-        t_role = _norm_role(str(t_role))
+        if not isinstance(t_role, str):
+            return None
+        t_role = _norm_role(t_role)
 
     return (src, conf, t_role)
 
@@ -328,6 +364,21 @@ def extract_pairs(jsonl_path: Path,
     drop_if_target_role_inconsistent: 若 True，reply.target_role 存在但与解析得到的 src.role 不一致时丢弃。
     * 文本合法性过滤项见函数签名。
     """
+    if min_confidence is not None:
+        threshold = _strict_confidence(min_confidence, "min_confidence")
+        min_confidence = threshold
+
+    min_src_chars = _strict_nonnegative_int(min_src_chars, "min_src_chars")
+    min_reply_chars = _strict_nonnegative_int(min_reply_chars, "min_reply_chars")
+    if max_src_chars is not None:
+        max_src_chars = _strict_nonnegative_int(max_src_chars, "max_src_chars")
+        if max_src_chars < min_src_chars:
+            raise ValueError("max_src_chars must be >= min_src_chars")
+    if max_reply_chars is not None:
+        max_reply_chars = _strict_nonnegative_int(max_reply_chars, "max_reply_chars")
+        if max_reply_chars < min_reply_chars:
+            raise ValueError("max_reply_chars must be >= min_reply_chars")
+
     # 预处理：规范化角色对
     norm_pairs = [(_norm_role(a), _norm_role(b)) for a, b in role_pairs]
     want = set(norm_pairs)
@@ -386,7 +437,15 @@ def extract_pairs(jsonl_path: Path,
             # 这类错误在 build_index 已经告警；这里直接跳过
             continue
 
-        cur = idx.get(UtteranceKey(int(cid), int(di)))
+        try:
+            cur_key = UtteranceKey(
+                _strict_nonnegative_int(cid, "chunk_id"),
+                _strict_nonnegative_int(di, "dialogue_index"),
+            )
+        except (TypeError, ValueError):
+            _diag("discarded", "malformed_record_id")
+            continue
+        cur = idx.get(cur_key)
         if cur is None:
             _diag("discarded", "index_record_missing")
             continue
@@ -404,6 +463,16 @@ def extract_pairs(jsonl_path: Path,
 
         src_role = _norm_role(src.role)
         tgt_role = _norm_role(cur.role)
+
+        if src.key.chunk_id != cur.key.chunk_id:
+            _diag("discarded", "reply_crosses_chunk", cur=cur, src=src, confidence=conf)
+            continue
+        if src.key.index >= cur.key.index:
+            _diag("discarded", "reply_not_earlier", cur=cur, src=src, confidence=conf)
+            continue
+        if src_role == tgt_role:
+            _diag("discarded", "same_speaker_reply", cur=cur, src=src, confidence=conf)
+            continue
 
         # 若要求一致性，且 target_role 存在但与解析到的 src.role 不同，则丢弃
         if drop_if_target_role_inconsistent and target_role_field is not None:
@@ -437,7 +506,7 @@ def extract_pairs(jsonl_path: Path,
             if conf is None:
                 _diag("discarded", "confidence_missing", cur=cur, src=src, pair=pair, confidence=conf)
                 continue
-            if float(conf) < float(min_confidence):
+            if conf < min_confidence:
                 _diag("discarded", "confidence_below_threshold", cur=cur, src=src, pair=pair, confidence=conf)
                 continue
 
@@ -611,6 +680,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[ERR] 输入文件不存在: {jsonl_path}", file=sys.stderr)
         return 2
 
+    output_paths: List[Path] = []
+    if args.merge_out:
+        output_paths.append(Path(args.merge_out))
+    else:
+        target_dir = Path(args.out) if args.out else Path("pair_datasets")
+        # Pair names are known after role selection; the directory itself may
+        # still be the input path through a symlink, checked again below.
+        if target_dir.exists() and target_dir.is_file():
+            print(f"[ERR] 输出目录是一个文件: {target_dir}", file=sys.stderr)
+            return 2
+    if args.diagnostics_out:
+        output_paths.append(Path(args.diagnostics_out))
+    if any(_paths_collide(jsonl_path, path) for path in output_paths):
+        print("[ERR] 输出路径不能覆盖输入 JSONL", file=sys.stderr)
+        return 2
+
     # 可选：校验
     if args.validate_path:
         mod = _try_import_validator(Path(args.validate_path))
@@ -666,6 +751,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             uniq_pairs.append(p)
             seen.add(p)
     role_pairs = uniq_pairs
+
+    if not args.merge_out:
+        target_dir = Path(args.out) if args.out else Path("pair_datasets")
+        generated = [target_dir / _safe_pair_name(src, tgt) for src, tgt in role_pairs]
+        if any(_paths_collide(jsonl_path, path) for path in generated):
+            print("[ERR] pair 输出路径不能覆盖输入 JSONL", file=sys.stderr)
+            return 2
+        output_paths.extend(generated)
+    if any(
+        _paths_collide(path, other)
+        for index, path in enumerate(output_paths)
+        for other in output_paths[index + 1:]
+    ):
+        print("[ERR] 输出路径必须彼此不同", file=sys.stderr)
+        return 2
 
     # 严格模式设置
     require_confidence = bool(args.require_confidence or args.strict)

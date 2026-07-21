@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 cd "$(dirname "$0")"
-if [ ! -d ".venv" ]; then
+if [ ! -x ".venv/bin/python" ]; then
   python3 -m venv .venv
 fi
-. .venv/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install -r text2dialog/requirements.txt
-cd text2dialog
+if [ ! -x ".venv/bin/text2dialog-server" ]; then
+  .venv/bin/python -m pip install -e .
+fi
 HOST="${TEXT2DIALOG_HOST:-127.0.0.1}"
 PORT="${TEXT2DIALOG_PORT:-8000}"
-python3 -m uvicorn server:app --host "$HOST" --port "$PORT"
+.venv/bin/text2dialog-server --host "$HOST" --port "$PORT"
